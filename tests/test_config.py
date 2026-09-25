@@ -40,3 +40,8 @@ def test_shipped_catalog_loads_and_embed_aliases_hold_one_model():
 def test_step_options_are_kept():
     catalog = load_catalog(ROOT / "providers.yaml")
     assert "voice" in catalog.realtime.s2s[0].options
+
+
+def test_every_shipped_tts_step_names_a_voice():
+    catalog = load_catalog(ROOT / "providers.yaml")
+    assert all("voice" in s.options for s in catalog.aliases["tts"] + catalog.realtime.tts[1:])

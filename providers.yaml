@@ -33,9 +33,10 @@ aliases:
     - {provider: mistral, model: voxtral-mini-latest}
     - {provider: elevenlabs, model: scribe_v1}
   tts:
-    - {provider: gemini, model: gemini-3.8-flash-lite-tts}
-    - {provider: groq, model: canopylabs/orpheus-v1-english}   # 200 characters per request
-    - {provider: elevenlabs, model: eleven_flash_v2_5}
+    # Voices differ per provider, so each step names its own.
+    - {provider: gemini, model: gemini-3.8-flash-lite-tts, voice: Kore}
+    - {provider: groq, model: canopylabs/orpheus-v1-english, voice: autumn}   # 200 characters per request
+    - {provider: elevenlabs, model: eleven_flash_v2_5, voice: 21m00Tcm4TlvDq8ikWAM}
 
 realtime:
   s2s:                   # speech-to-speech, tried in order
