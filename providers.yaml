@@ -1,0 +1,53 @@
+# Fallback chains per task alias. First step with a usable key wins; a step whose provider
+# has no <PROVIDER>_API_KEYS in the environment is skipped. No secrets in this file.
+# Researched 2026-09-26: every provider here has a free tier that needs no card.
+# Extra keys on a step (besides provider/model) are passed to LiteLLM or the voice service.
+
+aliases:
+  chat-smart:            # tool calling
+    - {provider: mistral, model: mistral-medium-latest}
+    - {provider: groq, model: openai/gpt-oss-120b}
+    - {provider: nvidia_nim, model: moonshotai/kimi-k3}
+    - {provider: openrouter, model: "nvidia/nemotron-3-ultra-550b-a55b:free"}
+    - {provider: openrouter, model: "qwen/qwen3.8-27b:free"}
+    - {provider: gemini, model: gemini-3.7-flash}
+    - {provider: sambanova, model: DeepSeek-V3.2}
+  chat-fast:
+    - {provider: groq, model: openai/gpt-oss-20b}
+    - {provider: gemini, model: gemini-3.5-flash-lite}
+    - {provider: zai, model: glm-4.7-flash}
+    - {provider: mistral, model: mistral-small-latest}
+    - {provider: cloudflare, model: "@cf/openai/gpt-oss-120b"}
+
+  # One model per embedding alias: vectors from different models don't mix.
+  embed-gemini:
+    - {provider: gemini, model: gemini-embedding-2}
+  embed-mistral:
+    - {provider: mistral, model: mistral-embed}
+  embed-bge-m3:
+    - {provider: cloudflare, model: "@cf/baai/bge-m3"}
+
+  stt:
+    - {provider: groq, model: whisper-large-v3-turbo}
+    - {provider: deepgram, model: nova-3}
+    - {provider: mistral, model: voxtral-mini-latest}
+    - {provider: elevenlabs, model: scribe_v1}
+  tts:
+    - {provider: gemini, model: gemini-3.8-flash-lite-tts}
+    - {provider: groq, model: canopylabs/orpheus-v1-english}   # 200 characters per request
+    - {provider: elevenlabs, model: eleven_flash_v2_5}
+
+realtime:
+  s2s:                   # speech-to-speech, tried in order
+    - {provider: gemini, model: models/gemini-3.8-live, voice: Charon}
+  stt:                   # cascade fallback: streaming STT → llm alias → streaming TTS
+    - {provider: deepgram, model: nova-3}
+    - {provider: assemblyai, model: universal-streaming}
+    - {provider: speechmatics, model: enhanced}
+    - {provider: cartesia, model: ink-whisper}
+  llm: chat-fast
+  tts:
+    - {provider: deepgram, model: aura-2-thalia-en}
+    - {provider: cartesia, model: sonic-3, voice: 71a7ad14-091c-4e8e-a314-022ece01c121}
+    - {provider: rime, model: mistv3, voice: astra}
+    - {provider: elevenlabs, model: eleven_flash_v2_5, voice: 21m00Tcm4TlvDq8ikWAM}

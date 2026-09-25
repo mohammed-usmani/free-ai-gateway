@@ -1,0 +1,25 @@
+[project]
+name = "free-ai-gateway"
+version = "0.1.0"
+description = "OpenAI-compatible gateway over no-card free AI tiers, with key rotation and fallback"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "litellm==1.102.1",
+    "pipecat-ai[google,silero,deepgram,cartesia,assemblyai,speechmatics,rime,elevenlabs,openai]==1.11.0",
+    "fastapi",
+    "uvicorn[standard]",
+    "python-multipart",
+    "pyyaml",
+    "python-dotenv",
+]
+
+[dependency-groups]
+dev = ["pytest", "pytest-asyncio", "httpx", "openai"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.uv]
+package = false
