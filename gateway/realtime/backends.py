@@ -47,7 +47,7 @@ TOOL_TIMEOUT = 30
 
 def status_from_error(frame: ErrorFrame) -> int | None:
     status = getattr(frame.exception, "status_code", None) or getattr(frame.exception, "code", None)
-    if isinstance(status, int):
+    if isinstance(status, int) and 100 <= status < 600:  # not websocket close codes (1008, 1011)
         return status
     text = f"{getattr(frame, 'category', '')} {frame.error}".lower()
     if re.search(r"\b(401|403)\b|auth|api key|permission", text):
@@ -159,6 +159,7 @@ class PipecatBackend:
         self._pending: dict[str, asyncio.Future] = {}
         self._emit: Emit | None = None
         self._config: dict = {}
+        self._stopping = False
 
     async def start(self, config: dict, emit: Emit):
         self._emit, self._config = emit, dict(config)
@@ -172,12 +173,19 @@ class PipecatBackend:
 
         @self._worker.event_handler("on_pipeline_error")
         async def on_error(_worker, frame: ErrorFrame):
-            if frame.fatal or (frame.processor and not frame.processor.is_usable):
-                self.fail(status_from_error(frame))
+            # Gemini Live reports quota loss and reconnect give-ups as non-permanent errors,
+            # so key/quota errors and give-ups count as failures too, not only unusable ones.
+            status = status_from_error(frame)
+            gave_up = "max consecutive" in str(frame.error).lower()
+            if frame.fatal or (frame.processor and not frame.processor.is_usable) or status in (401, 403, 429) or gave_up:
+                self.fail(status)
 
         runner = WorkerRunner(handle_sigint=False)
         await runner.add_workers(self._worker)
+        self._stopping = False
         self._runner_task = asyncio.create_task(runner.run())
+        # A pipeline that ends without us stopping it (setup timeout, cancel on error) is dead.
+        self._runner_task.add_done_callback(lambda _t: None if self._stopping else self.fail(None))
 
     def fail(self, status: int | None):
         if not self.failed.is_set():
@@ -226,6 +234,7 @@ class PipecatBackend:
         await params.result_callback(result)
 
     async def stop(self):
+        self._stopping = True
         for future in self._pending.values():
             future.cancel()
         self._pending.clear()
@@ -315,6 +324,8 @@ def cascade_option(chain: RealtimeChain, keys: dict[str, list[str]], pool: KeyPo
 
     def option():
         if not any(keys.get(s.provider) for s in chain.stt) or not any(keys.get(s.provider) for s in chain.tts):
+            return None
+        if pool.pick("cascade", ["-"]) is None:  # the cascade failed recently; don't loop on it
             return None
 
         def build(backend: PipecatBackend, config: dict, emit: Emit):

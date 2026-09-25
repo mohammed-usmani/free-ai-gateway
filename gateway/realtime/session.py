@@ -9,6 +9,7 @@ history is not carried over.
 
 import asyncio
 import base64
+import json
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
@@ -74,7 +75,14 @@ class RealtimeSession:
         await self.send(event("session.created", session={"id": f"sess_{uuid.uuid4().hex[:20]}", **self.config}))
         try:
             while True:
-                await self._handle(await self.ws.receive_json())
+                raw = await self.ws.receive_text()
+                try:
+                    msg = json.loads(raw)
+                    if not isinstance(msg, dict):
+                        raise ValueError("expected a JSON object")
+                    await self._handle(msg)
+                except ValueError as exc:  # bad JSON, bad base64 (binascii.Error is a ValueError)
+                    await self.send(error_event(f"malformed event: {exc}"))
         except (WebSocketDisconnect, NoBackend):
             pass
         finally:
@@ -87,11 +95,18 @@ class RealtimeSession:
         kind = msg.get("type")
         if kind == "session.update":
             self.config.update(msg.get("session") or {})
-            if self.backend:
-                await self.backend.update(self.config)
+            async with self._lock:  # never restart a backend that failover is retiring
+                backend = self.backend
+                if backend and not backend.failed.is_set():
+                    try:
+                        await backend.update(self.config)
+                    except Exception:  # noqa: BLE001 — a backend that can't take the config has failed
+                        log.exception("realtime backend %s rejected session.update", backend.name)
+                        backend.failed.set()
             await self.send(event("session.updated", session=self.config))
         elif kind == "input_audio_buffer.append":
-            await (await self._active()).send_audio(base64.b64decode(msg.get("audio", "")))
+            pcm = base64.b64decode(msg.get("audio", ""), validate=True)
+            await (await self._active()).send_audio(pcm)
         elif kind == "input_audio_buffer.commit":
             await self.send(event("input_audio_buffer.committed"))
         elif kind == "input_audio_buffer.clear":
@@ -101,8 +116,9 @@ class RealtimeSession:
         elif kind == "response.create":
             await (await self._active()).respond()
         elif kind == "response.cancel":
-            if self.backend:
-                await self.backend.cancel()
+            async with self._lock:
+                if self.backend and not self.backend.failed.is_set():
+                    await self.backend.cancel()
         else:
             await self.send(error_event(f"unsupported event type {kind!r}"))
 
@@ -141,9 +157,12 @@ class RealtimeSession:
                 continue
             try:
                 await backend.start(self.config, self.send)
-            except Exception:  # noqa: BLE001 — any start failure means try the next one
+            except Exception:  # noqa: BLE001 — any start failure means try the next option
                 log.exception("realtime backend %s failed to start", backend.name)
                 await self._retire(backend)
+                # A start failure is usually config or code, not the key: re-asking the same
+                # option would spin. (Key failures surface after start, via `failed`.)
+                self._option += 1
                 continue
             self.backend = backend
             self._watch = asyncio.create_task(self._on_failure(backend))

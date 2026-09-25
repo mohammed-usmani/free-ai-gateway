@@ -160,3 +160,46 @@ def test_unknown_events_get_a_non_fatal_error(pool):
         ws.receive_json()
         ws.send_json({"type": "bogus.event"})
         assert next_of(ws, "error")["error"]["type"] == "invalid_request_error"
+
+
+class BrokenOnStart(FakeBackend):
+    """Like a real PipecatBackend whose build raises: no failure recorded, no await point."""
+
+    async def start(self, config, emit):
+        raise ValueError("no adapter")
+
+
+def test_backend_that_cannot_start_is_not_retried_forever(pool):
+    options = [lambda: BrokenOnStart("x", []), option([FakeBackend("b", [])])]
+    with TestClient(app_with(options, pool)).websocket_connect("/rt") as ws:
+        ws.receive_json()
+        ws.send_json(audio(b"hi"))
+        assert base64.b64decode(next_of(ws, "response.output_audio.delta")["delta"]) == b"b"
+
+
+class UpdateFails(FakeBackend):
+    async def update(self, config):
+        raise KeyError("name")
+
+
+def test_update_failure_fails_over_instead_of_closing(pool):
+    log = []
+    options = [option([UpdateFails("a", log)]), option([FakeBackend("b", log)])]
+    with TestClient(app_with(options, pool)).websocket_connect("/rt") as ws:
+        ws.receive_json()
+        ws.send_json(audio(b"hi"))
+        next_of(ws, "response.output_audio.delta")
+        ws.send_json({"type": "session.update", "session": {"tools": [{}]}})
+        ws.send_json(audio(b"again"))
+        assert base64.b64decode(next_of(ws, "response.output_audio.delta")["delta"]) == b"b"
+
+
+def test_malformed_client_messages_get_an_error_event(pool):
+    with TestClient(app_with([option([FakeBackend("a", [])])], pool)).websocket_connect("/rt") as ws:
+        ws.receive_json()
+        ws.send_text("not json")
+        assert next_of(ws, "error")["error"]["type"] == "invalid_request_error"
+        ws.send_json({"type": "input_audio_buffer.append", "audio": "@@not-base64@@"})
+        assert next_of(ws, "error")["error"]["type"] == "invalid_request_error"
+        ws.send_json(audio(b"ok"))
+        next_of(ws, "response.output_audio.delta")

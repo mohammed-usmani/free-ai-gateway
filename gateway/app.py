@@ -17,6 +17,19 @@ from gateway.realtime.session import RealtimeSession
 from gateway.router import Exhausted, Gateway, status_of
 
 
+# Request fields LiteLLM would treat as overrides of the configured deployment: they could
+# send our provider keys to another host, swap the key, or re-enable fallback on 400s.
+_NOT_FROM_CLIENTS = {
+    "api_base", "base_url", "api_key", "api_version", "custom_llm_provider", "fallbacks",
+    "context_window_fallbacks", "content_policy_fallbacks", "num_retries", "max_retries", "timeout",
+    "mock_response", "metadata", "extra_headers", "headers", "model_list", "user_config",
+}
+
+
+def _client_params(body: dict) -> dict:
+    return {k: v for k, v in body.items() if k not in _NOT_FROM_CLIENTS and not k.startswith("litellm")}
+
+
 def _error(status: int, message: str, kind: str, headers: dict | None = None) -> JSONResponse:
     return JSONResponse({"error": {"message": message, "type": kind}}, status, headers)
 
@@ -61,7 +74,7 @@ def create_app(gateway: Gateway, pool: KeyPool, gateway_key: str, realtime=None)
 
     @app.post("/v1/chat/completions", dependencies=auth)
     async def chat(request: Request):
-        body = await request.json()
+        body = _client_params(await request.json())
         model = body.pop("model", "")
         resp, group, skipped = await gateway.call("acompletion", model, **body)
         if not body.get("stream"):
@@ -79,7 +92,7 @@ def create_app(gateway: Gateway, pool: KeyPool, gateway_key: str, realtime=None)
 
     @app.post("/v1/embeddings", dependencies=auth)
     async def embeddings(request: Request):
-        body = await request.json()
+        body = _client_params(await request.json())
         model = body.pop("model", "")
         resp, group, skipped = await gateway.call("aembedding", model, **body)
         return JSONResponse(resp.model_dump(), headers=headers(group, skipped))
@@ -98,7 +111,7 @@ def create_app(gateway: Gateway, pool: KeyPool, gateway_key: str, realtime=None)
 
     @app.post("/v1/audio/speech", dependencies=auth)
     async def speech(request: Request):
-        body = await request.json()
+        body = _client_params(await request.json())
         model = body.pop("model", "tts")
         # Voices are per provider: an alias uses each step's configured voice.
         if model in gateway.aliases():

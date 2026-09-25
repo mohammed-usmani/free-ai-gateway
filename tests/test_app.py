@@ -133,3 +133,13 @@ def test_build_reads_env(monkeypatch, tmp_path):
     client = TestClient(build())
     assert client.get("/health").json()["providers"]["groq"]["keys"] == 2
     assert any(r.path == "/v1/realtime" for r in client.app.routes)
+
+
+def test_clients_cannot_redirect_or_replace_provider_keys(make_client, upstream_url):
+    from tests import fake_upstream
+
+    r = chat(make_client({"groq": ["g1"]}), api_base="http://127.0.0.1:1/v1", api_key="attacker",
+             fallbacks=["x"], num_retries=9, mock_response="pwned")
+    assert r.status_code == 200
+    assert r.json()["choices"][0]["message"]["content"] == "m1:g1"
+    assert fake_upstream.calls[-1][1] == "g1"

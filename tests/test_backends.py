@@ -225,3 +225,49 @@ async def test_cascade_shape_carries_a_turn_from_audio_to_audio():
     assert base64.b64decode(next(e for e in events if e["type"] == "response.output_audio.delta")["delta"]) == b"\x03\x04"
     assert [e["transcript"] for e in events if e["type"].endswith("transcription.completed")] == ["hello"]
     await backend.stop()
+
+
+class GenaiStyleError(Exception):
+    code = 1011  # a websocket close code, not an HTTP status
+
+
+class QuotaDrop(FrameProcessor):
+    """What Gemini Live does on quota loss: a non-permanent error carrying a close code."""
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame):
+            await self.push_error("1011 RESOURCE_EXHAUSTED: quota exceeded", exception=GenaiStyleError())
+            return
+        await self.push_frame(frame, direction)
+
+
+async def test_quota_error_fails_the_backend_even_when_not_permanent():
+    backend, _ = await started(lambda b, c, e: [QuotaDrop(), EventSink(e)])
+    await backend.send_audio(b"x")
+    await asyncio.wait_for(backend.failed.wait(), 3)
+    assert backend.failure == ("gemini", "k1", 429)
+
+
+async def test_pipeline_ending_on_its_own_fails_the_backend():
+    backend, _ = await started()
+    await backend._worker.cancel()
+    await asyncio.wait_for(backend.failed.wait(), 5)
+
+
+async def test_stop_does_not_count_as_failure():
+    backend, _ = await started()
+    await backend.stop()
+    await asyncio.sleep(0.1)
+    assert not backend.failed.is_set()
+
+
+def test_failed_cascade_cools_down(pool):
+    option = cascade_option(CHAIN, {"deepgram": ["d"]}, pool, "http://x/v1", "g")
+    assert option() is not None
+    pool.report("cascade", "-", None)
+    assert option() is None
+
+
+def test_close_codes_are_not_mistaken_for_http_status():
+    assert status_from_error(ErrorFrame(error="socket", exception=GenaiStyleError())) is None
