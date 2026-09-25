@@ -12,6 +12,8 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from gateway.config import load_catalog, load_keys
 from gateway.keypool import KeyPool, mask
+from gateway.realtime.backends import realtime_options
+from gateway.realtime.session import RealtimeSession
 from gateway.router import Exhausted, Gateway, status_of
 
 
@@ -139,4 +141,11 @@ def build() -> FastAPI:
     catalog = load_catalog(os.environ.get("PROVIDERS_FILE", Path(__file__).parent.parent / "providers.yaml"))
     gateway = Gateway(catalog, keys)
     pool = KeyPool(os.environ.get("KEYPOOL_DB", "keypool.db"))
-    return create_app(gateway, pool, gateway_key)
+    # The cascade's LLM step calls this gateway's own chat endpoint, so it gets fallback too.
+    self_url = os.environ.get("GATEWAY_SELF_URL", f"http://127.0.0.1:{os.environ.get('PORT', '8000')}/v1")
+    options = realtime_options(catalog.realtime, keys, pool, self_url, gateway_key)
+
+    async def realtime(ws: WebSocket):
+        await RealtimeSession(ws, options, pool).run()
+
+    return create_app(gateway, pool, gateway_key, realtime)

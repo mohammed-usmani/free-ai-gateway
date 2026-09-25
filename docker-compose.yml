@@ -1,0 +1,11 @@
+services:
+  gateway:
+    build: .
+    env_file: .env
+    ports:
+      - "127.0.0.1:8000:8000"   # put a TLS proxy (e.g. Caddy) in front for remote callers
+    volumes:
+      - keypool:/data
+    restart: unless-stopped
+volumes:
+  keypool:

@@ -1,0 +1,6 @@
+.venv
+.env
+.superpowers
+tests
+*.db
+__pycache__

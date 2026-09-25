@@ -103,3 +103,33 @@ def test_health_masks_keys_and_needs_no_auth(make_client):
     assert r.status_code == 200
     assert "gsk_verysecret_1234" not in r.text
     assert r.json()["providers"]["groq"]["keys"] == 1
+
+
+def test_realtime_requires_the_gateway_key_and_runs_a_session(upstream_url, tmp_path):
+    from starlette.websockets import WebSocketDisconnect
+
+    from gateway.realtime.session import RealtimeSession
+    from tests.test_realtime_session import FakeBackend, option
+
+    pool = KeyPool(str(tmp_path / "k.db"))
+    log = []
+    gw = Gateway(Catalog({}, RealtimeChain([], [], "chat", [])), {})
+    app = create_app(gw, pool, "gw-secret",
+                     realtime=lambda ws: RealtimeSession(ws, [option([FakeBackend("a", log)])], pool).run())
+    client = TestClient(app)
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/v1/realtime") as ws:
+            ws.receive_json()
+    with client.websocket_connect("/v1/realtime?model=anything", headers=AUTH) as ws:
+        assert ws.receive_json()["type"] == "session.created"
+
+
+def test_build_reads_env(monkeypatch, tmp_path):
+    from gateway.app import build
+
+    monkeypatch.setenv("GATEWAY_API_KEY", "gw-secret")
+    monkeypatch.setenv("GROQ_API_KEYS", "g1,g2")
+    monkeypatch.setenv("KEYPOOL_DB", str(tmp_path / "k.db"))
+    client = TestClient(build())
+    assert client.get("/health").json()["providers"]["groq"]["keys"] == 2
+    assert any(r.path == "/v1/realtime" for r in client.app.routes)
