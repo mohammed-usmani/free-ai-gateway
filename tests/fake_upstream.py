@@ -110,3 +110,45 @@ def start() -> str:
     while not server.started:
         time.sleep(0.01)
     return f"http://127.0.0.1:{port}/v1"
+
+
+@app.post("/v1/rerank")
+async def rerank(request: Request):
+    key, err = _fail(request)
+    if err:
+        return err
+    body = await request.json()
+    docs = body["documents"]
+    ranked = sorted(range(len(docs)), key=lambda i: -len(str(docs[i])))[: body.get("top_n") or len(docs)]
+    return {"model": body["model"], "results": [{"index": i, "relevance_score": 1 / (n + 1)} for n, i in enumerate(ranked)],
+            "usage": {"total_tokens": 42}}
+
+
+@app.post("/client/v4/accounts/{account}/ai/run/{model:path}")
+async def cloudflare_run(account: str, model: str, request: Request):
+    key, err = _fail(request)
+    if err:
+        return err
+    body = await request.json()
+    import base64
+    return {"success": True, "result": {"image": base64.b64encode(f"{account}:{model}:{body['prompt']}".encode()).decode()}}
+
+
+@app.post("/v1/images/generations")
+async def images(request: Request):
+    key, err = _fail(request)
+    if err:
+        return err
+    body = await request.json()
+    return {"created": 0, "data": [{"b64_json": "aW1n", "revised_prompt": body["prompt"]}]}
+
+
+@app.post("/v1/moderations")
+async def moderations(request: Request):
+    key, err = _fail(request)
+    if err:
+        return err
+    body = await request.json()
+    return {"id": "modr", "model": body.get("model", "omni-moderation-latest"),
+            "results": [{"flagged": "kill" in str(body["input"]), "categories": {"violence": "kill" in str(body["input"])},
+                         "category_scores": {"violence": 0.9 if "kill" in str(body["input"]) else 0.01}}]}

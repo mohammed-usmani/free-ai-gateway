@@ -13,6 +13,9 @@ import litellm
 from litellm import Router
 
 from gateway.capabilities import GATEWAY_STEP_OPTIONS, needs_for, step_can
+from gateway.cloudflare_images import register as register_cloudflare_images
+
+register_cloudflare_images()
 from gateway.config import Catalog, Step, available
 
 
@@ -99,7 +102,9 @@ class Gateway:
         return [
             {
                 "model_name": group,
-                "litellm_params": {"model": f"{step.provider}/{step.model}", "api_key": key,
+                # `provider` names the keys; `custom_llm_provider` (optional) names the API to speak.
+                "litellm_params": {"model": f"{step.options.get('custom_llm_provider', step.provider)}/{step.model}",
+                                   "api_key": key,
                                    **{k: v for k, v in step.options.items() if k not in GATEWAY_STEP_OPTIONS}},
             }
             for key in self.keys[step.provider]

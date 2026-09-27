@@ -34,6 +34,9 @@ _LITELLM_KEYS = {
     "audio_output": ["output_cost_per_audio_token"],
     "audio_cache_read": ["cache_read_input_audio_token_cost"],
     "per_second": ["input_cost_per_second"],
+    "per_query": ["input_cost_per_query"],
+    "per_image": ["output_cost_per_image"],
+    "image_output": ["output_cost_per_image_token"],
     "per_character": ["input_cost_per_character", "output_cost_per_character"],
 }
 
@@ -51,6 +54,9 @@ class Counts:
     audio_cache_read: int = 0
     audio_seconds: float = 0.0
     characters: int = 0
+    searches: int = 0  # rerank queries
+    images: int = 0  # generated images (per-image pricing)
+    image_output: int = 0  # image output tokens (token-priced image models)
 
     def __add__(self, other: "Counts") -> "Counts":
         return Counts(**{f.name: getattr(self, f.name) + getattr(other, f.name) for f in fields(self)})
@@ -60,7 +66,8 @@ class Counts:
 _BUCKET_UNIT = {"input": "input", "cache_read": "cache_read", "cache_write": "cache_write",
                 "cache_write_1h": "cache_write_1h", "output": "output",
                 "audio_input": "audio_input", "audio_output": "audio_output",
-                "audio_cache_read": "audio_cache_read", "audio_seconds": "per_second", "characters": "per_character"}
+                "audio_cache_read": "audio_cache_read", "audio_seconds": "per_second", "characters": "per_character",
+                "searches": "per_query", "images": "per_image", "image_output": "image_output"}
 
 
 @dataclass

@@ -47,6 +47,23 @@ aliases:
       - {provider: gemini, model: gemini-3.1-flash-tts-preview, voice: Kore}
     fallback_to: free/tts
 
+  rerank:
+    steps:
+      - {provider: cohere, model: rerank-v4.0-pro}
+      - {provider: voyage, model: rerank-2.5}
+      - {provider: jina_ai, model: jina-reranker-v3}
+    fallback_to: free/rerank
+  image:
+    steps:
+      - {provider: gemini, model: gemini-3.1-flash-lite-image}
+      - {provider: openai, model: gpt-image-2.5-flare}
+      - {provider: gemini, model: gemini-3.1-flash-image}
+    fallback_to: free/image
+  moderation:
+    steps:
+      - {provider: openai, model: omni-moderation-latest}
+    fallback_to: free/moderation
+
 realtime:
   s2s:
     - {provider: openai, model: gpt-realtime-2.1, voice: marin}

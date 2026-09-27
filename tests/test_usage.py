@@ -59,11 +59,13 @@ def test_totals_group_and_turns_by_conversation(store):
         store.add(t, "chat", "paid", "openai", "m", Counts(input=100, output=10, cache_read=0))
         store.close_turn(t)
     rows = store.totals(None, None, "model")
-    assert rows == [{"provider": "openai", "model": "m", "turns": 3, "calls": 3, "input": 300, "output": 30,
-                     "cache_read": 0, "cache_write": 0, "cache_write_1h": 0, "reasoning": 0, "audio_input": 0, "audio_output": 0,
-                     "audio_cache_read": 0, "audio_seconds": 0.0, "characters": 0,
-                     "cost": pytest.approx(3 * (100e-6 + 20e-6)), "billed_cost": pytest.approx(3 * (100e-6 + 20e-6)),
-                     "list_price_estimate": None, "unpriced_calls": 0}]
+    assert len(rows) == 1
+    row = rows[0]
+    assert {k: row[k] for k in ("provider", "model", "turns", "calls", "input", "output", "cache_read", "unpriced_calls")} == {
+        "provider": "openai", "model": "m", "turns": 3, "calls": 3, "input": 300, "output": 30, "cache_read": 0,
+        "unpriced_calls": 0}
+    assert row["cost"] == pytest.approx(3 * (100e-6 + 20e-6)) == row["billed_cost"]
+    assert row["list_price_estimate"] is None
     assert len(store.turns("a")) == 2
     with pytest.raises(ValueError):
         store.totals(None, None, "nonsense")

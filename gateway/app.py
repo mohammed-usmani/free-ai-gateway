@@ -160,6 +160,24 @@ def _anthropic_counts(u) -> Counts:
                   cache_write=int(u.get("cache_creation_input_tokens") or 0), output=int(u.get("output_tokens") or 0))
 
 
+def _rerank_counts(resp) -> Counts:
+    """Search-billed rerankers (Cohere) report search units; token-billed ones report tokens."""
+    meta = getattr(resp, "meta", None) or (resp.get("meta") if isinstance(resp, dict) else None) or {}
+    billed = meta.get("billed_units") or {}
+    if billed.get("search_units"):
+        return Counts(searches=int(billed["search_units"]))
+    tokens = billed.get("total_tokens") or (meta.get("tokens") or {}).get("input_tokens")
+    return Counts(input=int(tokens)) if tokens else Counts(searches=1)
+
+
+def _image_counts(resp) -> Counts:
+    u = getattr(resp, "usage", None)
+    out = getattr(u, "output_tokens", None) if u is not None else None
+    if out:  # token-priced image models (gpt-image)
+        return Counts(input=int(getattr(u, "input_tokens", 0) or 0), image_output=int(out))
+    return Counts(images=len(getattr(resp, "data", None) or []))
+
+
 def _was_cached(resp) -> bool:
     return bool((getattr(resp, "_hidden_params", None) or {}).get("cache_hit"))
 
@@ -196,7 +214,7 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
     responses = responses or ResponseStore(":memory:")
 
     def scrub(text: str) -> str:
-        for key in all_keys:
+        for key in (k for k in all_keys if len(k) >= 8):  # real keys; short test strings would mangle text
             text = text.replace(key, mask(key))
         return text
 
@@ -260,7 +278,7 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
         return usage.open_turn(mode, endpoint, alias, request.headers.get("x-gateway-conversation-id")), True, None
 
     def record(turn: tuple[str, bool, str | None], kind: str, answer: Answer, counts: Counts, started: float,
-               usage_obj=None, attempt: str = "ok"):
+               usage_obj=None, attempt: str = "ok", free: bool = False):
         """Never lets bookkeeping fail a request the provider already answered."""
         turn_id, is_new, kind_override = turn
         provider, _, name = answer.group.partition("/")
@@ -268,7 +286,7 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
             usage.add(turn_id, kind_override or kind, answer.mode, provider, name, counts, attempt=attempt,
                       fallbacks=answer.skipped,
                       latency_ms=int((time.monotonic() - started) * 1000),
-                      provider_cost=reported_cost(provider, usage_obj))
+                      provider_cost=0.0 if free else reported_cost(provider, usage_obj))
             if is_new:
                 usage.close_turn(turn_id)
         except Exception:  # noqa: BLE001
@@ -409,6 +427,38 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
 
         return StreamingResponse(relay(), media_type="text/event-stream",
                                  headers={**headers(answer), "x-gateway-turn-id": turn[0]})
+
+    @app.post("/v1/rerank", dependencies=auth)
+    async def rerank(request: Request):
+        body = _client_params(await _json_object(request))
+        model = body.pop("model", "rerank")
+        started = time.monotonic()
+        answer = await modes.call("arerank", model, private=_private(request), **body)
+        turn = begin(request, "rerank", model)
+        record(turn, "rerank", answer, _rerank_counts(answer.resp), started)
+        data = answer.resp.model_dump() if hasattr(answer.resp, "model_dump") else dict(answer.resp)
+        return JSONResponse({k: v for k, v in data.items() if not k.startswith("_")},
+                            headers={**headers(answer), "x-gateway-turn-id": turn[0]})
+
+    @app.post("/v1/images/generations", dependencies=auth)
+    async def images(request: Request):
+        body = _client_params(await _json_object(request))
+        model = body.pop("model", "image")
+        started = time.monotonic()
+        answer = await modes.call("aimage_generation", model, private=_private(request), **body)
+        turn = begin(request, "image", model)
+        record(turn, "image", answer, _image_counts(answer.resp), started)
+        return JSONResponse(answer.resp.model_dump(), headers={**headers(answer), "x-gateway-turn-id": turn[0]})
+
+    @app.post("/v1/moderations", dependencies=auth)
+    async def moderations(request: Request):
+        body = _client_params(await _json_object(request))
+        model = body.pop("model", "moderation")
+        started = time.monotonic()
+        answer = await modes.call("amoderation", model, private=_private(request), **body)
+        turn = begin(request, "moderation", model)
+        record(turn, "moderation", answer, Counts(), started, free=True)  # OpenAI moderation is free
+        return JSONResponse(answer.resp.model_dump(), headers={**headers(answer), "x-gateway-turn-id": turn[0]})
 
     @app.post("/v1/audio/transcriptions", dependencies=auth)
     async def transcriptions(

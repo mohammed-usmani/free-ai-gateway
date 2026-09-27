@@ -38,6 +38,18 @@ aliases:
     - {provider: groq, model: canopylabs/orpheus-v1-english, voice: autumn}   # 200 characters per request
     - {provider: elevenlabs, model: eleven_flash_v2_5, voice: 21m00Tcm4TlvDq8ikWAM}
 
+  # Retrieval, images, moderation (researched 2026-09-27).
+  rerank:
+    - {provider: jina_ai, model: jina-reranker-v3}
+    - {provider: voyage, model: rerank-2.5}          # 3 RPM without a card
+    - {provider: cohere, model: rerank-v3.5}         # trial key: non-commercial
+    - {provider: nvidia_nim, model: nvidia/llama-3_2-nv-rerankqa-1b-v2}
+  image:
+    - {provider: cloudflare, model: "@cf/black-forest-labs/flux-1-schnell", custom_llm_provider: cloudflare_images}
+    - {provider: pollinations, model: flux, custom_llm_provider: openai, api_base: "https://gen.pollinations.ai/v1"}
+  moderation:
+    - {provider: openai, model: omni-moderation-latest}   # free with any OpenAI key
+
 realtime:
   s2s:                   # speech-to-speech, tried in order
     - {provider: gemini, model: models/gemini-3.8-live, voice: Charon}
