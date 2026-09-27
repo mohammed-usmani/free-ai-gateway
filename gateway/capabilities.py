@@ -39,6 +39,29 @@ def _has_image(items) -> bool:
     return False
 
 
+_IMAGE_TOKENS = 1000  # rough cost of one image; its base64 bytes are not text tokens
+
+
+def _size(items) -> int:
+    """Token estimate for Responses/Anthropic payloads: text by length, images at a flat rate."""
+    images = 0
+
+    def strip(node):
+        nonlocal images
+        if isinstance(node, dict):
+            if node.get("type") in _IMAGE_TYPES:
+                images += 1
+                return None
+            return {k: strip(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [strip(v) for v in node]
+        if isinstance(node, str) and (node.startswith("data:") or len(node) > 100_000):
+            return ""  # inline file/data payloads
+        return node
+
+    return len(json.dumps(strip(items), default=str)) // 4 + images * _IMAGE_TOKENS
+
+
 def _tokens(messages) -> int:
     try:
         return litellm.token_counter(model="gpt-4o", messages=messages)
@@ -56,14 +79,13 @@ def needs_for(method: str, kwargs: dict) -> Needs:
     if method == "aresponses":
         items = kwargs.get("input")
         items = items if isinstance(items, list) else [{"role": "user", "content": str(items or "")}]
-        fmt = ((kwargs.get("text") or {}).get("format") or {})
+        text = kwargs.get("text") if isinstance(kwargs.get("text"), dict) else {}
+        fmt = text.get("format") if isinstance(text.get("format"), dict) else {}
         return Needs(vision=_has_image(items), tools=bool(kwargs.get("tools")),
-                     json_schema=fmt.get("type") == "json_schema",
-                     prompt_tokens=len(json.dumps(items, default=str)) // 4)
+                     json_schema=fmt.get("type") == "json_schema", prompt_tokens=_size(items))
     if method == "aanthropic_messages":
         messages = kwargs.get("messages") or []
-        return Needs(vision=_has_image(messages), tools=bool(kwargs.get("tools")),
-                     prompt_tokens=len(json.dumps(messages, default=str)) // 4)
+        return Needs(vision=_has_image(messages), tools=bool(kwargs.get("tools")), prompt_tokens=_size(messages))
     return Needs()
 
 
@@ -87,8 +109,9 @@ def step_can(step: Step, needs: Needs) -> tuple[bool, str]:
         info = _info(step) if info is None else info
         return info.get(info_key)
 
-    if needs.vision and known("vision", "supports_vision") is False:
-        return False, "no vision"
+    # Vision is default-deny: some providers silently drop image parts and answer from the text.
+    if needs.vision and known("vision", "supports_vision") is not True:
+        return False, "no known vision support"
     if needs.tools and known("tools", "supports_function_calling") is False:
         return False, "no tools"
     if needs.json_schema and known("json_schema", "supports_response_schema") is False:

@@ -107,6 +107,11 @@ class Observer:
             seconds = daily_reset_seconds(exc, provider)
             if seconds:
                 model_id = (kwargs.get("litellm_params") or {}).get("model_info", {}).get("id")
+                # LiteLLM already cooled it for its short default; that entry's TTL would survive an
+                # overwrite, so remove it first or the key is retried within a minute.
+                from litellm.router_utils.cooldown_cache import CooldownCache
+
+                router.cooldown_cache.in_memory_cache.delete_cache(CooldownCache.get_cooldown_cache_key(model_id))
                 router.cooldown_cache.add_deployment_to_cooldown(model_id, exc, 429, seconds)
                 self.pool.report(f"quota:{mode}:{group}", key, 429, retry_after=seconds)
                 log.warning("%s key …%s hit its daily quota; benched for %.0f min", group, key[-4:], seconds / 60)

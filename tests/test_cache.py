@@ -56,3 +56,15 @@ def test_cache_false_header_wins_over_alias(setup):
     for _ in range(2):
         client.post("/v1/chat/completions", headers={**AUTH, "x-gateway-cache": "false"}, json={**MSG, "model": "cached-chat"})
     assert len(fake_upstream.calls) == 2
+
+
+def test_private_and_stateful_requests_never_use_the_cache(upstream_url, tmp_path):
+    enable_cache(str(tmp_path / "cache2"), ttl=60)
+    o = {"api_base": upstream_url}
+    cat = Catalog({"chat": [Step("openai", "m", o)]}, RealtimeChain([], [], "chat", []), privacy={"openai": "no"})
+    client = TestClient(create_app(Modes({"free": Gateway(cat, {"openai": ["k"]})}), KeyPool(str(tmp_path / "k.db")), "s"))
+    h = {**AUTH, "x-gateway-cache": "true"}
+    for _ in range(2):
+        client.post("/v1/chat/completions", headers={**h, "x-gateway-private": "true"}, json=MSG)
+    assert len(fake_upstream.calls) == 2  # private: cache bypassed
+    litellm.cache = None

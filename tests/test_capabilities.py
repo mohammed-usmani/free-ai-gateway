@@ -23,7 +23,10 @@ def test_needs_are_read_from_the_request():
 def test_step_capability_uses_overrides_then_litellm_info():
     assert not step_can(Step("x", "m", {"supports": {"vision": False}}), Needs(vision=True))[0]
     assert step_can(Step("x", "m", {"supports": {"vision": True}}), Needs(vision=True))[0]
-    assert step_can(Step("unknownprov", "unknown-model"), Needs(vision=True, tools=True))[0]  # unknown → try
+    assert step_can(Step("unknownprov", "unknown-model"), Needs(tools=True))[0]  # unknown tools → try
+    # unknown vision → skip: some providers silently drop images and answer anyway
+    assert not step_can(Step("unknownprov", "unknown-model"), Needs(vision=True))[0]
+    assert not step_can(Step("groq", "openai/gpt-oss-20b"), Needs(vision=True))[0]
     assert not step_can(Step("openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free"), Needs(vision=True))[0]
     ok, reason = step_can(Step("x", "m", {"supports": {"max_input_tokens": 100}}), Needs(prompt_tokens=500))
     assert not ok and "context" in reason
@@ -40,7 +43,7 @@ async def ask(g, messages=TEXT_MSG):
 
 async def test_image_request_skips_text_only_steps(upstream_url):
     o = {"api_base": upstream_url}
-    g = gw(upstream_url, [Step("groq", "text-only", {**o, "supports": {"vision": False}}), Step("openrouter", "seer", o)],
+    g = gw(upstream_url, [Step("groq", "text-only", {**o, "supports": {"vision": False}}), Step("openrouter", "seer", {**o, "supports": {"vision": True}})],
            {"groq": ["g"], "openrouter": ["o"]})
     assert await ask(g, IMAGE_MSG) == ("seer:o", "openrouter/seer", 1)
     assert all(k != "g" for _, k in fake_upstream.calls)
@@ -93,7 +96,8 @@ async def test_paid_chain_that_cannot_do_it_falls_back_to_free(upstream_url):
     from gateway.modes import Modes
 
     o = {"api_base": upstream_url}
-    free = Gateway(Catalog({"chat": [Step("openrouter", "seer", o)]}, RealtimeChain([], [], "chat", [])), {"openrouter": ["o"]})
+    free = Gateway(Catalog({"chat": [Step("openrouter", "seer", {**o, "supports": {"vision": True}})]},
+                           RealtimeChain([], [], "chat", [])), {"openrouter": ["o"]})
     paid = Gateway(Catalog({"chat": [Step("openai", "blind", {**o, "supports": {"vision": False}})]},
                            RealtimeChain([], [], "chat", []), fallback_to={"chat": "free/chat"}), {"openai": ["p"]})
     answer = await Modes({"free": free, "paid": paid}).call("acompletion", "paid/chat", messages=IMAGE_MSG)
@@ -106,3 +110,14 @@ def test_retired_model_ids_fall_back():
 
     exc = litellm.BadRequestError("nvidia/x:free is not a valid model ID", "openrouter", "x")
     assert should_fall_back(exc)
+
+
+def test_image_payloads_do_not_inflate_the_size_estimate():
+    big = "data:image/png;base64," + "A" * 2_000_000
+    n = needs_for("aresponses", {"input": [{"role": "user", "content": [{"type": "input_text", "text": "what?"},
+                                                                          {"type": "input_image", "image_url": big}]}]})
+    assert n.vision and n.prompt_tokens < 5000
+    m = needs_for("aanthropic_messages", {"messages": [{"role": "user", "content": [
+        {"type": "image", "source": {"type": "base64", "data": "A" * 2_000_000}}]}]})
+    assert m.vision and m.prompt_tokens < 5000
+    assert needs_for("aresponses", {"input": "hi", "text": "not-a-dict"}).json_schema is False

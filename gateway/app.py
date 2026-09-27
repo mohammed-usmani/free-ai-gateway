@@ -40,6 +40,7 @@ _NOT_FROM_CLIENTS = {
     "api_base", "base_url", "api_key", "api_version", "custom_llm_provider", "fallbacks",
     "context_window_fallbacks", "content_policy_fallbacks", "num_retries", "max_retries", "timeout",
     "mock_response", "metadata", "extra_headers", "headers", "model_list", "user_config",
+    "private", "caching", "cache", "method",  # gateway arguments
 }
 
 
@@ -259,7 +260,8 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
 
     def cache_args(request: Request, model: str) -> dict:
         # The router passes caching=False unless told otherwise, so opted-in calls say so.
-        if litellm.cache is not None and _cache_wanted(request, modes, model):
+        # Private requests never use the cache: an entry may come from a provider that trains on data.
+        if litellm.cache is not None and not _private(request) and _cache_wanted(request, modes, model):
             return {"caching": True, "cache": {"use-cache": True}}
         return {}
 
@@ -345,8 +347,8 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
         new_items = as_items(body.pop("input", None))
         items = history + new_items
         started = time.monotonic()
-        answer = await modes.call("aresponses", model, private=_private(request), input=items, store=False,
-                                  **body, **cache_args(request, model))
+        # Not cached: responses are stateful (ids, store/DELETE) and a cache would outlive a DELETE.
+        answer = await modes.call("aresponses", model, private=_private(request), input=items, store=False, **body)
         turn = begin(request, "responses", model)
 
         def finish(resp):
@@ -681,7 +683,9 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
 def build() -> FastAPI:
     """uvicorn factory: `uvicorn gateway.app:build --factory`."""
     load_dotenv()
-    gateway_key = os.environ["GATEWAY_API_KEY"]
+    gateway_key = os.environ.get("GATEWAY_API_KEY", "").strip()
+    if not gateway_key:
+        raise RuntimeError("GATEWAY_API_KEY must be set (an empty key would let any request in)")
     root = Path(__file__).parent.parent
     files = {"free": os.environ.get("PROVIDERS_FILE", root / "providers.free.yaml"),
              "paid": os.environ.get("PAID_PROVIDERS_FILE", root / "providers.paid.yaml")}
@@ -694,6 +698,7 @@ def build() -> FastAPI:
     pool = KeyPool(state_db)
     pricer = Pricer({m: c.prices for m, c in catalogs.items()})
     usage = UsageStore(state_db, pricer)
+    responses = ResponseStore(state_db, retention_days=float(os.environ.get("RESPONSES_RETENTION_DAYS", 30)))
     observer = Observer(pool, sink=usage.log_attempt)
     modes = Modes({m: Gateway(c, mode_keys[m], mode=m, observer=observer) for m, c in catalogs.items()})
     # The cascade's LLM step calls this gateway's own chat endpoint, so it gets fallback too.
@@ -722,13 +727,22 @@ def build() -> FastAPI:
     enable_cache(os.environ.get("CACHE_DIR", ".cache/responses"), float(os.environ.get("CACHE_TTL", 86400)))
     refresh_hours = float(os.environ.get("PRICE_REFRESH_HOURS", "6"))
 
+    attempt_days = float(os.environ.get("ATTEMPTS_RETENTION_DAYS", 30))
+
+    async def housekeeping():
+        while True:  # expired stored responses and old attempt logs leave the disk daily
+            await asyncio.to_thread(responses.purge)
+            await asyncio.to_thread(usage.purge_attempts, attempt_days)
+            await asyncio.sleep(86400)
+
     @asynccontextmanager
     async def lifespan(_app):
         task = asyncio.create_task(pricer.refresh_forever(refresh_hours)) if refresh_hours > 0 else None
+        cleaner = asyncio.create_task(housekeeping())
         yield
+        cleaner.cancel()
         if task:
             task.cancel()
         process_lock.release()
 
-    responses = ResponseStore(state_db, retention_days=float(os.environ.get("RESPONSES_RETENTION_DAYS", 30)))
     return create_app(modes, pool, gateway_key, realtime, usage, lifespan, responses)

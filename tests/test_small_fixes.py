@@ -165,3 +165,36 @@ def test_unrelated_api_key_variables_are_not_providers():
 
 def test_masks_show_only_the_last_four_characters():
     assert mask("gsk_verysecret_1234") == "…1234"
+
+
+def test_body_fields_that_clash_with_gateway_arguments_are_ignored(setup):
+    client, _, _ = setup
+    for extra in ({"private": True}, {"caching": True}, {"cache": {"no-cache": True}}, {"method": "x"}):
+        r = client.post("/v1/chat/completions", headers=AUTH,
+                        json={"model": "chat", "messages": [{"role": "user", "content": "hi"}], **extra})
+        assert r.status_code == 200, extra
+
+
+def test_empty_gateway_key_refuses_to_start(monkeypatch, tmp_path):
+    from gateway.app import build
+
+    monkeypatch.setenv("GATEWAY_API_KEY", "")
+    monkeypatch.setenv("STATE_DB", str(tmp_path / "s.db"))
+    with pytest.raises(RuntimeError, match="GATEWAY_API_KEY"):
+        build()
+
+
+def test_expired_responses_are_purged_on_start(tmp_path):
+    import sqlite3
+    from gateway.responses import ResponseStore
+
+    ResponseStore(str(tmp_path / "r.db"), clock=lambda: 1000.0).save("old", [], [], {"id": "old"})
+    ResponseStore(str(tmp_path / "r.db"), clock=lambda: 1000.0 + 40 * 86400)  # just opening it purges
+    assert sqlite3.connect(str(tmp_path / "r.db")).execute("SELECT COUNT(*) FROM responses").fetchone()[0] == 0
+
+
+def test_old_attempts_are_purged(tmp_path):
+    usage = UsageStore(str(tmp_path / "s.db"), Pricer({}, bundled={}, fetch=None), clock=lambda: 100 * 86400.0)
+    usage.log_attempt({"at": 1.0, "mode": "free", "provider": "p", "model": "m", "key": None, "ok": True,
+                       "status": None, "error": None, "latency_ms": 1, "cache_hit": False})
+    assert usage.purge_attempts(days=30) == 1

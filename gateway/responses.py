@@ -24,6 +24,7 @@ class ResponseStore:
         self._clock = clock
         self._retention = retention_days * 86400
         self._lock = threading.Lock()
+        self.purge()  # expired conversations leave the disk at start, not only on the next save
 
     def save(self, response_id: str, input_items: list, output_items: list, response: dict):
         with self._lock:

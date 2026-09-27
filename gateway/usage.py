@@ -104,6 +104,10 @@ class UsageStore:
                              (row["at"], row["mode"], row["provider"], row["model"], row["key"], int(row["ok"]),
                               row["status"], row["error"], row["latency_ms"], int(row["cache_hit"])))
 
+    def purge_attempts(self, days: float) -> int:
+        with self._lock:
+            return self._db.execute("DELETE FROM attempts WHERE at < ?", (self._now() - days * 86400,)).rowcount
+
     def metrics(self, window_seconds: float) -> dict:
         """Reliability per provider/model (from every attempt) and fallback rate per alias."""
         since = self._now() - window_seconds

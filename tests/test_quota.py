@@ -93,3 +93,26 @@ async def test_attempts_are_logged(upstream_url, tmp_path):
     assert ("groq", False) in got and ("openrouter", True) in got
     assert all(r["mode"] == "paid" and r["latency_ms"] >= 0 for r in rows)
     assert "rl" not in str(rows)
+
+
+async def test_daily_bench_outlasts_the_normal_cooldown(upstream_url, tmp_path):
+    from gateway.config import ModeSettings
+
+    pool = KeyPool(str(tmp_path / "k.db"))
+    obs = Observer(pool)
+    cat = Catalog({"chat": [Step("gemini", "g", {"api_base": upstream_url, "custom_llm_provider": "openai"})]},
+                  RealtimeChain([], [], "chat", []), settings=ModeSettings(cooldown_seconds=1, num_retries=1))
+    g = Gateway(cat, {"gemini": ["day", "good"]}, mode="free", observer=obs)
+    for _ in range(20):
+        await g.call("acompletion", "chat", messages=[{"role": "user", "content": "hi"}])
+        if pool.pick("quota:free:gemini/g", ["day"]) is None:
+            break
+    for _ in range(100):
+        if pool.pick("quota:free:gemini/g", ["day"]) is None:
+            break
+        await asyncio.sleep(0.05)
+    await asyncio.sleep(1.6)  # past LiteLLM's own 1 s cooldown
+    fake_upstream.calls.clear()
+    for _ in range(6):
+        await g.call("acompletion", "chat", messages=[{"role": "user", "content": "hi"}])
+    assert {k for _, k in fake_upstream.calls} == {"good"}
