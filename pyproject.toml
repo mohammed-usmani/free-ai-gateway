@@ -16,7 +16,14 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest", "pytest-asyncio", "httpx", "openai"]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "httpx",
+    "openai",
+    "openai-agents>=0.20.0",
+    "anthropic>=1.8.0",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

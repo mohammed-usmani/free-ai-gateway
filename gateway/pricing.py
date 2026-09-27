@@ -232,8 +232,12 @@ def _twin(table: dict, provider: str, model: str, units: dict) -> str | None:
     for name, entry in table.items():
         if not isinstance(entry, dict) or entry.get("litellm_provider") not in (provider, None):
             continue
-        if _family(name) == _family(model) or name.split("/")[-1].startswith(model) or model.startswith(name.split("/")[-1]):
-            continue  # a dated snapshot or alias of the same model
+        short = name.split("/")[-1]
+        if "latest" in short or "latest" in model or _family(short) == _family(model):
+            continue  # a moving alias ("-latest") or dated snapshot of the same model
+        a, b = sorted((_family(short), _family(model)), key=len)
+        if b.startswith(a):
+            continue  # a version tag on the same family, e.g. mistral-medium vs mistral-medium-3
         other = _units_from_litellm(entry)
         if {k: other.get(k) for k in _BASIC} == probe:
             return name.split("/")[-1] if "/" in name else name

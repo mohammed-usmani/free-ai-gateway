@@ -60,6 +60,31 @@ async def speech_roundtrip(client, prefix):
             + cost_note(client, text.headers))
 
 
+async def rerank(client, prefix):
+    r = httpx.post(f"{client.base_url}rerank", headers={"Authorization": f"Bearer {client.api_key}"}, timeout=60,
+                   json={"model": f"{prefix}rerank", "query": "capital of France",
+                         "documents": ["Berlin is in Germany", "Paris is the capital of France"]})
+    r.raise_for_status()
+    return f"{r.headers.get('x-gateway-model')} → top doc {r.json()['results'][0]['index']}" + cost_note(client, r.headers)
+
+
+async def image(client, prefix):
+    raw = await client.images.with_raw_response.generate(model=f"{prefix}image", prompt="a small red cube")
+    return f"{raw.headers.get('x-gateway-model')} → {len(raw.parse().data)} image(s)" + cost_note(client, raw.headers)
+
+
+async def moderation(client, prefix):
+    raw = await client.moderations.with_raw_response.create(model=f"{prefix}moderation", input="hello there")
+    return f"{raw.headers.get('x-gateway-model')} → flagged={raw.parse().results[0].flagged}"
+
+
+async def responses(client, prefix):
+    first = await client.responses.create(model=f"{prefix}chat-fast", input="My name is Mo. Reply OK.")
+    second = await client.responses.create(model=f"{prefix}chat-fast", input="What is my name?",
+                                           previous_response_id=first.id)
+    return f"remembers: {second.output_text[:60]!r}"
+
+
 async def realtime(client, prefix):
     async with client.realtime.connect(model=f"{prefix}realtime") as conn:
         await conn.recv()
@@ -99,7 +124,18 @@ async def main():
             results.append(await check(prefix + alias, embed(client, prefix + alias)))
     if "tts" in aliases and "stt" in aliases:
         results.append(await check(f"{prefix}tts→stt", speech_roundtrip(client, prefix)))
+    if "rerank" in aliases:
+        results.append(await check(f"{prefix}rerank", rerank(client, prefix)))
+    if "image" in aliases:
+        results.append(await check(f"{prefix}image", image(client, prefix)))
+    if "moderation" in aliases:
+        results.append(await check(f"{prefix}moderation", moderation(client, prefix)))
+    if "chat-fast" in aliases:
+        results.append(await check(f"{prefix}responses", responses(client, prefix)))
     results.append(await check(f"{prefix}realtime", realtime(client, prefix)))
+    health = httpx.get(args.url.removesuffix("/v1") + "/health").json()["pricing"]["health"]
+    for line in health["suspicious"]:
+        print("price check:", line)
     unpriced = httpx.get(args.url.removesuffix("/v1") + "/health").json()["pricing"]["unpriced"]
     if unpriced:
         print("\nno price known (add under prices: in the mode's yaml):", ", ".join(unpriced))

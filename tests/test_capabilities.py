@@ -98,3 +98,11 @@ async def test_paid_chain_that_cannot_do_it_falls_back_to_free(upstream_url):
                            RealtimeChain([], [], "chat", []), fallback_to={"chat": "free/chat"}), {"openai": ["p"]})
     answer = await Modes({"free": free, "paid": paid}).call("acompletion", "paid/chat", messages=IMAGE_MSG)
     assert answer.mode == "free"
+
+
+def test_retired_model_ids_fall_back():
+    import litellm
+    from gateway.router import should_fall_back
+
+    exc = litellm.BadRequestError("nvidia/x:free is not a valid model ID", "openrouter", "x")
+    assert should_fall_back(exc)

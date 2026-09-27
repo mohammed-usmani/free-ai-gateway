@@ -28,6 +28,13 @@ client.chat.completions.create(model="chat-smart", messages=[{"role": "user", "c
 | `POST /v1/audio/transcriptions` | `stt` |
 | `POST /v1/audio/speech` | `tts` |
 | `WS /v1/realtime` (OpenAI Realtime protocol, PCM16 24 kHz) | Gemini Live, else STT → `chat-fast` → TTS |
+| `WS /v1/realtime?intent=transcription` (or `session.type: "transcription"`) | streaming speech-to-text only |
+| `POST /v1/responses` (+ `GET`/`DELETE /v1/responses/{id}`) — OpenAI Agents SDK | any chat alias |
+| `POST /v1/messages` — Anthropic format (Claude Code, Anthropic SDK); `claude-*` names mapped by `model_map` | any chat alias |
+| `POST /v1/rerank` | `rerank` |
+| `POST /v1/images/generations` | `image` |
+| `POST /v1/moderations` | `moderation` |
+| `GET /v1/metrics`, `GET /metrics` (Prometheus), `GET /v1/pricing/health` | reliability and price checks |
 | `GET /v1/models`, `GET /health` | usable aliases; key states (masked) |
 
 Paid aliases (`providers.paid.yaml`): `paid/chat-best`, `paid/chat-smart`, `paid/chat-fast`,
@@ -64,7 +71,8 @@ curl ... localhost:8000/v1/usage/turns/<x-gateway-turn-id>                      
 curl ... "localhost:8000/v1/usage/turns?conversation_id=<id>"   # send x-gateway-conversation-id
 curl -X POST ... localhost:8000/v1/usage/reprice?from=2026-09-01                         # recompute
 ```
-`group_by`: model, provider, mode, alias, endpoint, kind, day. Realtime clients also get the
+`group_by`: model, provider, mode, alias, endpoint, kind, day. Every cost carries `cost_basis`:
+`billed` (paid mode) or `list_price_estimate` (free mode: what those calls would have cost). Realtime clients also get the
 turn's breakdown in `response.done.response.usage`. Prompts, outputs and keys are never stored.
 
 **Prices** come from, in order: the cost the provider reports (OpenRouter), your `prices:`
@@ -74,10 +82,31 @@ Unknown price → cost is recorded as `null`, never guessed; `/health` lists tho
 `pricing.unpriced` along with the price table's age. Streaming voice providers aren't in
 LiteLLM's table — add their rates under `prices:` to see their cost.
 
+## Request options
+
+| Header | Effect |
+|---|---|
+| `x-gateway-private: true` | only providers marked `trains_on_data: no` (Groq, Cloudflare, Jina, Rime, Speechmatics; paid OpenAI/Anthropic/Gemini). None available → 503 `no_private_provider`. Realtime: `?private=true`. |
+| `x-gateway-cache: true` / `false` | serve an identical earlier answer from the disk cache (no quota, recorded at $0). Off unless asked, or an alias sets `cache: true`. |
+| `x-gateway-conversation-id` | groups turns in `/v1/usage/turns` |
+| `x-api-key` | accepted instead of `Authorization: Bearer` (Anthropic clients) |
+
+Requests are matched to models that can serve them: a request with images, tools, a JSON schema
+or a long prompt skips steps LiteLLM knows can't (override per step with `supports:`), and an
+"unsupported" / "context too long" / "not a valid model" error moves on instead of failing.
+If nothing in the chain can do it you get a 400 `unsupported_request`.
+
+`/v1/responses` stores the conversation when `store` is true (OpenAI's default) so
+`previous_response_id` works with any provider; providers are always called with store off.
+Stored items are kept `RESPONSES_RETENTION_DAYS` (30). `store: false` keeps nothing.
+
 ## How fallback works
 
 - Each alias is an ordered chain of steps; a step is skipped when its provider has no keys.
 - Within a step, keys rotate; a key that gets 401/403/404/408/429/5xx cools down (LiteLLM).
+  A key that hits a **daily** quota (Gemini RPD, Groq RPD/TPD, OpenRouter free-models-per-day,
+  Cloudflare daily neurons, SambaNova RPD) is benched until the quota resets, and that survives
+  restarts.
 - A failing step moves to the next. A **400 is returned to you**, not retried elsewhere.
 - Streams fall back only before the first chunk; after that an error event ends the stream.
 - Embedding aliases hold one model each: vectors from different models don't mix.
@@ -98,6 +127,10 @@ make usage                   # usage totals by model
 make test                    # offline suite (fake upstream, no keys, no quota)
 ```
 
+Run **one process** per state file: routing state lives in memory, so the gateway takes a lock
+on `state.db.lock` and a second worker exits with a message (scale out would mean moving that
+state to Redis).
+
 If you run uvicorn on a port other than 8000, set `PORT` (or `GATEWAY_SELF_URL`) to match: the
 voice cascade calls the gateway's own chat endpoint there. The startup log prints the URL it uses.
 
@@ -112,6 +145,12 @@ AssemblyAI ($50), Speechmatics ($100), Cartesia and ElevenLabs (monthly, non-com
 
 Left out (card, top-up or retired): Cerebras, GitHub Models, Together, Moonshot, Scaleway,
 Nebius, Chutes, OpenAI Realtime, Google Cloud/Azure speech, Alibaba, Gladia, Soniox.
+
+Also: rerank (Jina, Voyage, Cohere trial, NVIDIA), images (Cloudflare FLUX via a small custom
+provider, Pollinations), moderation (OpenAI, free with any OpenAI key).
+
+Known quirk: LiteLLM's Anthropic-messages path sends OpenRouter model names with their
+`openrouter/` prefix; if OpenRouter rejects that, `/v1/messages` falls back to the next step.
 
 Things to know:
 - Keys in one account share one quota (Groq, Google). OpenRouter, Cohere and Hume forbid extra

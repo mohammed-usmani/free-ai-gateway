@@ -25,7 +25,9 @@ def status_of(exc: Exception) -> int | None:
 
 
 _CANT_DO = re.compile(r"does not support|doesn't support|not supported|unsupported|context length|context window|"
-                      r"maximum context|too many tokens|image input|vision", re.I)
+                      r"maximum context|too many tokens|image input|vision|"
+                      # a model id the provider no longer (or never) serves: free lists churn
+                      r"not a valid model|invalid model|model not found|does not exist|no such model|decommissioned", re.I)
 
 
 def should_fall_back(exc: Exception) -> bool:
