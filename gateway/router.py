@@ -40,6 +40,10 @@ class NoCapableStep(Exception):
     """No step of the chain can serve what this request needs."""
 
 
+class NoPrivateProvider(NoCapableStep):
+    """The request asked for private handling and no step's provider qualifies."""
+
+
 class UnknownModel(Exception):
     """No alias of that name, or the provider in `provider/model` has no keys."""
 
@@ -114,7 +118,7 @@ class Gateway:
                 self.router.add_deployment(litellm.types.router.Deployment(**d))
         return [model]
 
-    async def call(self, method: str, model: str, **kwargs):
+    async def call(self, method: str, model: str, private: bool = False, **kwargs):
         """Run `router.<method>` down the chain. Returns (response, group used, steps skipped).
 
         For streams, the first chunk is fetched here, so a provider that fails before
@@ -124,8 +128,13 @@ class Gateway:
         needs = needs_for(method, kwargs)
         chain = self.chain(model)
         reasons = []
+        private_skips = 0
         for skipped, group in enumerate(chain):
-            ok, why = step_can(self._steps.get(group) or Step(*group.split("/", 1)), needs)
+            step = self._steps.get(group) or Step(*group.split("/", 1))
+            ok, why = step_can(step, needs)
+            if ok and private and not self.catalog.is_private(step.provider):
+                ok, why = False, "may train on data"
+                private_skips += 1
             if not ok:
                 reasons.append(f"{group}: {why}")
                 if self.observer:
@@ -143,6 +152,8 @@ class Gateway:
                 if not should_fall_back(exc):
                     raise
                 last = exc
+        if private and private_skips == len(chain):
+            raise NoPrivateProvider(f"no provider for {model!r} is known not to train on API data")
         if len(reasons) == len(chain):
             raise NoCapableStep(f"no model for {model!r} supports this request ({needs.describe()}): " + "; ".join(reasons))
         raise Exhausted(last, self._retry_after(model))

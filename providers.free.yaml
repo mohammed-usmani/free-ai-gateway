@@ -52,3 +52,21 @@ realtime:
     - {provider: cartesia, model: sonic-3, voice: 71a7ad14-091c-4e8e-a314-022ece01c121}
     - {provider: rime, model: mistv3, voice: astra}
     - {provider: elevenlabs, model: eleven_flash_v2_5, voice: 21m00Tcm4TlvDq8ikWAM}
+
+# Does the provider train on (or human-review) free-tier API data? Researched 2026-09-27.
+# Requests with `x-gateway-private: true` only use providers marked `no`; unlisted = not private.
+providers:
+  groq: {trains_on_data: "no"}
+  cloudflare: {trains_on_data: "no"}
+  jina_ai: {trains_on_data: "no"}
+  speechmatics: {trains_on_data: "no"}
+  rime: {trains_on_data: "no"}
+  mistral: {trains_on_data: opt-out}      # Admin Console → Privacy
+  deepgram: {trains_on_data: opt-out}     # mip_opt_out per request
+  cartesia: {trains_on_data: opt-out}
+  elevenlabs: {trains_on_data: opt-out}
+  gemini: {trains_on_data: "yes"}         # free tier: human review
+  nvidia_nim: {trains_on_data: "yes"}
+  openrouter: {trains_on_data: "yes"}     # most free endpoints may train or publish
+  cohere: {trains_on_data: "yes"}
+  assemblyai: {trains_on_data: "yes"}     # free users can't opt out

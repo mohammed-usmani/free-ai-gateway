@@ -72,3 +72,13 @@ realtime:
 #   cartesia/sonic-3:
 #     - {effective_from: 2026-09-01, per_character: 0.00003}
 prices: {}
+
+# Paid API terms (researched 2026-09-27). `x-gateway-private: true` keeps only `no`.
+providers:
+  openai: {trains_on_data: "no"}
+  anthropic: {trains_on_data: "no"}
+  gemini: {trains_on_data: "no"}          # paid tier
+  jina_ai: {trains_on_data: "no"}
+  deepgram: {trains_on_data: opt-out}
+  cartesia: {trains_on_data: opt-out}
+  elevenlabs: {trains_on_data: opt-out}

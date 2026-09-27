@@ -29,7 +29,7 @@ from gateway.modes import Answer, Modes
 from gateway.observe import Observer
 from gateway.pricing import Counts, Pricer, counts_from_litellm
 from gateway.usage import UsageStore
-from gateway.router import Exhausted, Gateway, NoCapableStep, UnknownModel, should_fall_back, status_of
+from gateway.router import Exhausted, Gateway, NoCapableStep, NoPrivateProvider, UnknownModel, should_fall_back, status_of
 from gateway.speech import MEDIA_TYPES, SpeechError, can_stream, open_stream
 
 
@@ -54,6 +54,10 @@ async def _json_object(request: Request) -> dict:
     if not isinstance(body, dict):
         raise HTTPException(400, "body must be a JSON object")
     return body
+
+
+def _private(request) -> bool:
+    return (request.headers.get("x-gateway-private") or request.query_params.get("private") or "").lower() in ("1", "true", "yes")
 
 
 def _health_summary(report: list[dict]) -> dict:
@@ -162,6 +166,10 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
     async def unknown_model(_: Request, exc: UnknownModel):
         return _error(404, f"model {exc.args[0]!r} is not configured or has no keys", "model_not_found")
 
+    @app.exception_handler(NoPrivateProvider)
+    async def no_private(_: Request, exc: NoPrivateProvider):
+        return _error(503, str(exc), "no_private_provider")
+
     @app.exception_handler(NoCapableStep)
     async def no_capable_step(_: Request, exc: NoCapableStep):
         return _error(400, str(exc), "unsupported_request")
@@ -217,7 +225,7 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
         if body.get("stream"):
             body["stream_options"] = {**(body.get("stream_options") or {}), "include_usage": True}
         started = time.monotonic()
-        answer = await modes.call("acompletion", model, **body)
+        answer = await modes.call("acompletion", model, private=_private(request), **body)
         resp = answer.resp
         turn = begin(request, "chat", model)
         if not body.get("stream"):
@@ -239,7 +247,7 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
         body = _client_params(await _json_object(request))
         model = body.pop("model", "")
         started = time.monotonic()
-        answer = await modes.call("aembedding", model, **body)
+        answer = await modes.call("aembedding", model, private=_private(request), **body)
         turn = begin(request, "embed", model)
         u = answer.resp.usage
         record(turn, "embed", answer, Counts(input=int(getattr(u, "prompt_tokens", 0) or 0)), started)
@@ -256,7 +264,7 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
         data = await file.read()
         extra = {k: v for k, v in {"language": language, "prompt": prompt}.items() if v}
         started = time.monotonic()
-        answer = await modes.call("atranscription", model, file=(file.filename or "audio.wav", data), **extra)
+        answer = await modes.call("atranscription", model, private=_private(request), file=(file.filename or "audio.wav", data), **extra)
         turn = begin(request, "stt", model)
         record(turn, "stt", answer, _stt_counts(answer.resp, data), started)
         return JSONResponse({"text": answer.resp.text}, headers={**headers(answer), "x-gateway-turn-id": turn[0]})
@@ -281,6 +289,8 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
                 groups = []
             for group in groups:
                 step = gateway._steps.get(group) or Step(*group.split("/", 1))
+                if _private(request) and not gateway.catalog.is_private(step.provider):
+                    continue
                 voice = step.options.get("voice") if modes.is_alias(target) else (body.get("voice") or step.options.get("voice"))
                 try:
                     first, rest, close = await _start_speech(gateway, mode, group, step, text, voice, fmt, body)
@@ -307,6 +317,8 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
                                          headers={**headers(answer), "x-gateway-turn-id": turn[0]})
             target = gateway.catalog.fallback_to.get(name)
         if last is None:
+            if _private(request):
+                raise NoPrivateProvider(f"no text-to-speech provider for {model!r} is known not to train on API data")
             raise UnknownModel(model)
         raise Exhausted(last, modes.gateways[mode].settings.cooldown_seconds)
 
@@ -487,7 +499,7 @@ def build() -> FastAPI:
         model = ws.query_params.get("model", "realtime")
         usage.register_session(token, session_id, modes.split(model)[0])
         options = realtime_options_for(model, catalogs, mode_keys, pool, self_url, gateway_key,
-                                       RealtimeContext(usage, session_id, token))
+                                       RealtimeContext(usage, session_id, token), private=_private(ws))
         try:
             await RealtimeSession(ws, options, pool, session_id=session_id).run()
         finally:

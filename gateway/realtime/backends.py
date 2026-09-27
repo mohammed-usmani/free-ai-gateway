@@ -476,7 +476,8 @@ def _pick_services(steps: list[Step], keys, pool: KeyPool, mode: str, make, acct
 
 
 def cascade_option(chain: RealtimeChain, keys: dict[str, list[str]], pool: KeyPool,
-                   llm_base_url: str, gateway_key: str, mode: str = "free", ctx: RealtimeContext | None = None):
+                   llm_base_url: str, gateway_key: str, mode: str = "free", ctx: RealtimeContext | None = None,
+                   private: bool = False):
     """STT → the gateway's own chat alias → TTS. STT and TTS fail over inside the session."""
     pool_name = f"{mode}:cascade"
     llm_model = chain.llm_alias if mode == "free" else f"{mode}/{chain.llm_alias}"
@@ -504,7 +505,9 @@ def cascade_option(chain: RealtimeChain, keys: dict[str, list[str]], pool: KeyPo
                 raise RuntimeError("every STT or TTS key is cooling down")
             # The LLM step calls this gateway, tagged with the session so its usage (with the
             # provider that really answered) lands on the session's current turn.
-            headers = {"x-gateway-session": ctx.token or ctx.session_id} if ctx else None
+            headers = {"x-gateway-session": ctx.token or ctx.session_id} if ctx else {}
+            if private:
+                headers["x-gateway-private"] = "true"
             llm = OpenAILLMService(api_key=gateway_key, base_url=llm_base_url, default_headers=headers,
                                    settings=OpenAILLMService.Settings(model=llm_model))
             llm.register_function(None, backend.on_function_call)
@@ -535,14 +538,19 @@ _S2S = {"gemini": gemini_live_option, "openai": openai_realtime_option}
 
 
 def realtime_options(chain: RealtimeChain, keys, pool: KeyPool, llm_base_url: str, gateway_key: str,
-                     mode: str = "free", ctx: RealtimeContext | None = None):
-    return [_S2S[s.provider](s, keys, pool, mode, ctx) for s in chain.s2s if s.provider in _S2S] + [
-        cascade_option(chain, keys, pool, llm_base_url, gateway_key, mode, ctx)
+                     mode: str = "free", ctx: RealtimeContext | None = None, allowed=lambda provider: True,
+                     private: bool = False):
+    """`allowed` filters providers (privacy); the cascade keeps only allowed STT/TTS steps."""
+    cascade = RealtimeChain(chain.s2s, [s for s in chain.stt if allowed(s.provider)], chain.llm_alias,
+                            [s for s in chain.tts if allowed(s.provider)], chain.fallback_to)
+    return [_S2S[s.provider](s, keys, pool, mode, ctx) for s in chain.s2s if s.provider in _S2S and allowed(s.provider)] + [
+        cascade_option(cascade, keys, pool, llm_base_url, gateway_key, mode, ctx, private)
     ]
 
 
 def realtime_options_for(model: str, catalogs: dict[str, Catalog], mode_keys: dict[str, dict[str, list[str]]],
-                         pool: KeyPool, llm_base_url: str, gateway_key: str, ctx: RealtimeContext | None):
+                         pool: KeyPool, llm_base_url: str, gateway_key: str, ctx: RealtimeContext | None,
+                         private: bool = False):
     """`paid/realtime` → paid options, then those of `realtime.fallback_to` (another mode)."""
     head, _, rest = model.partition("/")
     mode = head if head in catalogs and rest else "free"
@@ -550,6 +558,9 @@ def realtime_options_for(model: str, catalogs: dict[str, Catalog], mode_keys: di
     while mode and mode in catalogs and mode not in seen:
         seen.add(mode)
         chain = catalogs[mode].realtime
-        options += realtime_options(chain, mode_keys.get(mode, {}), pool, llm_base_url, gateway_key, mode, ctx)
+        catalog = catalogs[mode]
+        allowed = (lambda p, c=catalog: c.is_private(p)) if private else (lambda p: True)
+        options += realtime_options(chain, mode_keys.get(mode, {}), pool, llm_base_url, gateway_key, mode, ctx,
+                                    allowed, private)
         mode = (chain.fallback_to or "").partition("/")[0] or None
     return options

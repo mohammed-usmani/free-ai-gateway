@@ -30,20 +30,20 @@ class Modes:
         mode, name = self.split(model)
         return name in self.gateways[mode].catalog.aliases
 
-    async def call(self, method: str, model: str, **kwargs) -> Answer:
+    async def call(self, method: str, model: str, private: bool = False, **kwargs) -> Answer:
         """Run in the model's mode; when its chain is exhausted (or has no keys at all),
         continue at the alias's `fallback_to`. Fallbacks are checked acyclic at load."""
         mode, name = self.split(model)
         gateway = self.gateways[mode]
         try:
-            resp, group, skipped = await gateway.call(method, name, **kwargs)
+            resp, group, skipped = await gateway.call(method, name, private=private, **kwargs)
             return Answer(resp, mode, group, skipped)
         except (Exhausted, UnknownModel, NoCapableStep) as exc:
             target = gateway.catalog.fallback_to.get(name)
             if not target or name not in gateway.catalog.aliases:
                 raise
             try:
-                return await self.call(method, target, **kwargs)
+                return await self.call(method, target, private=private, **kwargs)
             except UnknownModel:
                 # The fallback has no keys either: report why this chain failed.
                 if isinstance(exc, (Exhausted, NoCapableStep)):
