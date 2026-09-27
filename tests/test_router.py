@@ -2,7 +2,7 @@ import litellm
 import pytest
 
 from gateway.config import Catalog, RealtimeChain, Step
-from gateway.router import Exhausted, Gateway
+from gateway.router import Exhausted, Gateway, UnknownModel
 from tests import fake_upstream
 
 
@@ -51,9 +51,9 @@ async def test_steps_without_keys_are_left_out(upstream_url):
 
 def test_unknown_alias_and_keyless_provider_are_rejected(upstream_url):
     gw = gateway(upstream_url, {"groq": ["g1"]})
-    with pytest.raises(KeyError):
+    with pytest.raises(UnknownModel):
         gw.chain("nope")
-    with pytest.raises(KeyError):
+    with pytest.raises(UnknownModel):
         gw.chain("mistral/mistral-small-latest")
 
 

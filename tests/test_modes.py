@@ -2,7 +2,7 @@ import pytest
 
 from gateway.config import Catalog, ModeSettings, RealtimeChain, Step
 from gateway.modes import Modes
-from gateway.router import Exhausted, Gateway
+from gateway.router import Exhausted, Gateway, UnknownModel
 from tests import fake_upstream
 
 

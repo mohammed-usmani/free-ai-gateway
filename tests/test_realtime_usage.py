@@ -201,3 +201,28 @@ async def test_hang_up_mid_response_still_records_the_turn(usage):
     assert len(turns) == 1 and turns[0]["ended_at"] is not None
     comp = turns[0]["components"][0]
     assert (comp["kind"], comp["input"], comp["attempt"]) == ("s2s", 10, "failed")
+
+
+async def test_stopping_mid_response_closes_it_for_the_client(usage):
+    acct = TurnAccounting(usage, "sess4", "paid")
+
+    def build(backend, config, emit):
+        model = HalfAnswer()
+        acct.register(model, "s2s", "gemini", "live")
+        return [model, EventSink(emit, acct)]
+
+    backend = PipecatBackend("g", "paid:gemini", "k", build, accounting=acct)
+    events = []
+
+    async def emit(e):
+        events.append(e)
+
+    await backend.start({}, emit)
+    await asyncio.sleep(0.2)
+    await backend.send_audio(b"\x00")
+    await asyncio.sleep(0.3)
+    backend.fail(500)
+    await backend.stop()
+    done = [e for e in events if e["type"] == "response.done"]
+    assert len(done) == 1 and done[0]["response"]["status"] == "failed"
+    assert done[0]["response"]["usage"]["components"][0]["input"] == 10

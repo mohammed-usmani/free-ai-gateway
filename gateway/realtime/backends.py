@@ -81,6 +81,7 @@ def tools_schema(tools: list[dict] | None) -> ToolsSchema | None:
 class RealtimeContext:
     usage: UsageStore
     session_id: str
+    token: str | None = None  # private tag for the cascade's loopback chat call
 
 
 class TurnAccounting:
@@ -92,8 +93,9 @@ class TurnAccounting:
     provider really answered), so its Pipecat metrics are ignored here.
     """
 
-    def __init__(self, usage: UsageStore, session_id: str, mode: str):
+    def __init__(self, usage: UsageStore, session_id: str, mode: str, token: str | None = None):
         self.usage, self.session_id, self.mode = usage, session_id, mode
+        self.token = token or session_id
         self._services: dict[str, tuple[str, str, str]] = {}
         self._pending: dict[tuple[str, str, str], Counts] = {}
         self._turn: str | None = None
@@ -125,7 +127,7 @@ class TurnAccounting:
     def open(self) -> str:
         if self._turn is None:
             self._turn = self.usage.open_turn(self.mode, "realtime", "realtime", session_id=self.session_id)
-            self.usage.set_session_turn(self.session_id, self._turn)
+            self.usage.set_session_turn(self.token, self._turn)
         return self._turn
 
     def close(self, attempt: str = "ok") -> dict | None:
@@ -134,7 +136,7 @@ class TurnAccounting:
                 return None
             self.open()  # usage measured outside any response: still billed, still recorded
         turn, self._turn, self._last = self._turn, None, self._turn
-        self.usage.set_session_turn(self.session_id, None)
+        self.usage.set_session_turn(self.token, None)
         for (kind, provider, model), counts in self._pending.items():
             self.usage.add(turn, kind, self.mode, provider, model, counts, attempt=attempt)
         self._pending.clear()
@@ -189,11 +191,13 @@ class EventSink(TranscriptTap):
             await self._emit(event("response.created", response={"id": self._response, "status": "in_progress"}))
 
     async def _close(self, status: str = "completed"):
+        """Finish the open response (if any) for the client and close its turn."""
         if self._response:
             ids = {"response_id": self._response, "item_id": self._item, "output_index": 0, "content_index": 0}
             await self._emit(event("response.output_audio.done", **ids))
             await self._emit(event("response.output_audio_transcript.done", **ids))
-            usage = _usage_summary(self._accounting.close()) if self._accounting else None
+            usage = (_usage_summary(self._accounting.close(attempt="failed" if status == "failed" else "ok"))
+                     if self._accounting else None)
             await self._emit(event("response.done", response={"id": self._response, "status": status, "usage": usage}))
             self._response = None
 
@@ -256,6 +260,7 @@ class PipecatBackend:
     async def start(self, config: dict, emit: Emit):
         self._emit, self._config = emit, dict(config)
         processors = self._build(self, self._config, emit)
+        self._sinks = [p for p in processors if isinstance(p, EventSink)]
         self._worker = PipelineWorker(
             Pipeline(processors),
             params=PipelineParams(audio_in_sample_rate=RATE, audio_out_sample_rate=RATE,
@@ -339,6 +344,12 @@ class PipecatBackend:
             except (TimeoutError, asyncio.CancelledError):
                 self._runner_task.cancel()
         self._worker = self._runner_task = None
+        for sink in getattr(self, "_sinks", []):  # a response cut off here still gets its response.done
+            try:
+                await sink._close("failed" if self.failed.is_set() else "cancelled")
+            except Exception:  # noqa: BLE001 — the client may already be gone
+                log.debug("could not close the open response", exc_info=True)
+        self._sinks = []
         if self.accounting:  # hang-up or failover mid-response: keep what was measured
             try:
                 self.accounting.close(attempt="failed" if self.failed.is_set() else "ok")
@@ -357,7 +368,7 @@ def _voice(config: dict, step: Step, default: str) -> str:
 
 
 def _accounting(ctx: RealtimeContext | None, mode: str) -> TurnAccounting | None:
-    return TurnAccounting(ctx.usage, ctx.session_id, mode) if ctx else None
+    return TurnAccounting(ctx.usage, ctx.session_id, mode, ctx.token) if ctx else None
 
 
 def gemini_live_option(step: Step, keys: dict[str, list[str]], pool: KeyPool, mode: str = "free",
@@ -375,8 +386,9 @@ def gemini_live_option(step: Step, keys: dict[str, list[str]], pool: KeyPool, mo
 
             voice = _voice(config, step, "Charon")
             llm = GeminiLiveLLMService(
-                api_key=key, model=step.model, voice_id="Charon" if voice == "alloy" else voice,
-                system_instruction=config.get("instructions"), tools=tools_schema(config.get("tools")),
+                api_key=key, tools=tools_schema(config.get("tools")),
+                settings=GeminiLiveLLMService.Settings(model=step.model, voice="Charon" if voice == "alloy" else voice,
+                                                       system_instruction=config.get("instructions")),
             )
             llm.register_function(None, backend.on_function_call)
             if acct:
@@ -406,7 +418,8 @@ def openai_realtime_option(step: Step, keys: dict[str, list[str]], pool: KeyPool
                 instructions=config.get("instructions"), tools=tools_schema(config.get("tools")),
                 audio=AudioConfiguration(output=AudioOutput(voice=_voice(config, step, "marin"))),
             )
-            llm = OpenAIRealtimeLLMService(api_key=key, model=step.model, session_properties=props)
+            llm = OpenAIRealtimeLLMService(
+                api_key=key, settings=OpenAIRealtimeLLMService.Settings(model=step.model, session_properties=props))
             llm.register_function(None, backend.on_function_call)
             if acct:
                 acct.register(llm, "s2s", step.provider, step.model)
@@ -437,18 +450,17 @@ def _stt(step: Step, key: str):
 def _tts(step: Step, key: str):
     p, voice = step.provider, step.options.get("voice")
     if p == "deepgram":
-        from pipecat.services.deepgram.tts import DeepgramTTSService
-        return DeepgramTTSService(api_key=key, voice=step.model)
+        from pipecat.services.deepgram.tts import DeepgramTTSService as C
+        return C(api_key=key, settings=C.Settings(voice=step.model))  # Deepgram's voice id is the model
     if p == "cartesia":
-        from pipecat.services.cartesia.tts import CartesiaTTSService
-        return CartesiaTTSService(api_key=key, voice_id=voice, model=step.model)
-    if p == "rime":
-        from pipecat.services.rime.tts import RimeTTSService
-        return RimeTTSService(api_key=key, voice_id=voice, model=step.model)
-    if p == "elevenlabs":
-        from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
-        return ElevenLabsTTSService(api_key=key, voice_id=voice, model=step.model)
-    raise ValueError(f"no streaming TTS adapter for {p}")
+        from pipecat.services.cartesia.tts import CartesiaTTSService as C
+    elif p == "rime":
+        from pipecat.services.rime.tts import RimeTTSService as C
+    elif p == "elevenlabs":
+        from pipecat.services.elevenlabs.tts import ElevenLabsTTSService as C
+    else:
+        raise ValueError(f"no streaming TTS adapter for {p}")
+    return C(api_key=key, settings=C.Settings(model=step.model, voice=voice))
 
 
 def _pick_services(steps: list[Step], keys, pool: KeyPool, mode: str, make, acct, kind) -> list:
@@ -492,9 +504,9 @@ def cascade_option(chain: RealtimeChain, keys: dict[str, list[str]], pool: KeyPo
                 raise RuntimeError("every STT or TTS key is cooling down")
             # The LLM step calls this gateway, tagged with the session so its usage (with the
             # provider that really answered) lands on the session's current turn.
-            headers = {"x-gateway-session": ctx.session_id} if ctx else None
-            llm = OpenAILLMService(api_key=gateway_key, base_url=llm_base_url, model=llm_model,
-                                   default_headers=headers)
+            headers = {"x-gateway-session": ctx.token or ctx.session_id} if ctx else None
+            llm = OpenAILLMService(api_key=gateway_key, base_url=llm_base_url, default_headers=headers,
+                                   settings=OpenAILLMService.Settings(model=llm_model))
             llm.register_function(None, backend.on_function_call)
             if acct:
                 acct.register(llm, "llm", "cascade", llm_model)

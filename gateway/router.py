@@ -26,6 +26,10 @@ def should_fall_back(exc: Exception) -> bool:
     return status in (401, 403, 404, 408, 429) or status >= 500
 
 
+class UnknownModel(Exception):
+    """No alias of that name, or the provider in `provider/model` has no keys."""
+
+
 class Exhausted(Exception):
     """Every step failed with a fall-back-able error."""
 
@@ -82,7 +86,7 @@ class Gateway:
             return self._chains[model]
         provider, _, name = model.partition("/")
         if not name or not self.keys.get(provider):
-            raise KeyError(model)
+            raise UnknownModel(model)
         if model not in self._registered:
             self._registered.add(model)
             for d in self._deployments(model, Step(provider, name)):

@@ -126,5 +126,18 @@ def check_fallbacks(catalogs: Mapping[str, Catalog]) -> None:
             node = edges[node]
 
 
+def known_providers(keys: Mapping[str, list[str]], catalogs) -> dict[str, list[str]]:
+    """Drop env vars that merely look like provider keys (LANGSMITH_API_KEY…): keep providers a
+    catalog uses or LiteLLM can call (for `provider/model` passthrough)."""
+    import litellm
+
+    used = set()
+    for c in catalogs:
+        used |= {s.provider for steps in c.aliases.values() for s in steps}
+        used |= {s.provider for s in c.realtime.s2s + c.realtime.stt + c.realtime.tts}
+    callable_ = {str(getattr(p, "value", p)) for p in litellm.provider_list}
+    return {p: k for p, k in keys.items() if p in used or p in callable_}
+
+
 def available(steps: list[Step], keys: Mapping[str, list[str]]) -> list[Step]:
     return [s for s in steps if keys.get(s.provider)]

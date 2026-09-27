@@ -12,6 +12,7 @@ a plain sum and can be recomputed later.
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass, fields
 from datetime import date, datetime, timezone
 from importlib import resources
@@ -28,6 +29,7 @@ _LITELLM_KEYS = {
     "output": ["output_cost_per_token"],
     "cache_read": ["cache_read_input_token_cost"],
     "cache_write": ["cache_creation_input_token_cost"],
+    "cache_write_1h": ["cache_creation_input_token_cost_above_1hr"],
     "audio_input": ["input_cost_per_audio_token"],
     "audio_output": ["output_cost_per_audio_token"],
     "audio_cache_read": ["cache_read_input_audio_token_cost"],
@@ -40,7 +42,8 @@ _LITELLM_KEYS = {
 class Counts:
     input: int = 0  # uncached text input
     cache_read: int = 0
-    cache_write: int = 0
+    cache_write: int = 0  # 5-minute (default) cache writes
+    cache_write_1h: int = 0  # 1-hour cache writes (Anthropic), priced higher
     output: int = 0  # text output, reasoning included
     reasoning: int = 0  # informational: already inside output
     audio_input: int = 0  # uncached audio input
@@ -54,7 +57,8 @@ class Counts:
 
 
 # bucket → unit that prices it (reasoning is inside output, so it has none)
-_BUCKET_UNIT = {"input": "input", "cache_read": "cache_read", "cache_write": "cache_write", "output": "output",
+_BUCKET_UNIT = {"input": "input", "cache_read": "cache_read", "cache_write": "cache_write",
+                "cache_write_1h": "cache_write_1h", "output": "output",
                 "audio_input": "audio_input", "audio_output": "audio_output",
                 "audio_cache_read": "audio_cache_read", "audio_seconds": "per_second", "characters": "per_character"}
 
@@ -65,18 +69,36 @@ class Price:
     source: str
 
 
+def _prompt_size(c: Counts) -> int:
+    return c.input + c.cache_read + c.cache_write + c.cache_write_1h + c.audio_input + c.audio_cache_read
+
+
+def _rate(units: dict[str, float], unit: str, prompt: int) -> float | None:
+    """Base rate, or the highest long-context tier (`unit@<threshold>`) the prompt exceeds."""
+    tiers = [(int(k.split("@")[1]), v) for k, v in units.items() if k.startswith(unit + "@")]
+    above = [t for t in tiers if prompt > t[0]]
+    return max(above)[1] if above else units.get(unit)
+
+
 def cost(counts: Counts, price: Price | None) -> float | None:
     if price is None:
         return None
-    total = 0.0
+    total, prompt = 0.0, _prompt_size(counts)
     for bucket, unit in _BUCKET_UNIT.items():
         n = getattr(counts, bucket)
         if not n:
             continue
-        if unit not in price.units:
+        rate = _rate(price.units, unit, prompt)
+        if rate is None:
             return None  # a billed bucket we can't price: unknown, not zero
-        total += n * price.units[unit]
+        total += n * rate
     return total
+
+
+_TIER = re.compile(r"^(input_cost_per_token|output_cost_per_token|cache_read_input_token_cost|"
+                   r"cache_creation_input_token_cost)_above_(\d+)k_tokens$")
+_TIER_UNIT = {"input_cost_per_token": "input", "output_cost_per_token": "output",
+              "cache_read_input_token_cost": "cache_read", "cache_creation_input_token_cost": "cache_write"}
 
 
 def _units_from_litellm(entry: dict) -> dict[str, float]:
@@ -86,6 +108,9 @@ def _units_from_litellm(entry: dict) -> dict[str, float]:
             if entry.get(k) is not None:
                 units[unit] = float(entry[k])
                 break
+    for k, v in entry.items():  # long-context tiers; _priority/_flex service tiers don't match
+        if v is not None and (m := _TIER.match(k)):
+            units[f"{_TIER_UNIT[m.group(1)]}@{int(m.group(2)) * 1000}"] = float(v)
     return units
 
 
@@ -125,7 +150,10 @@ class Pricer:
                               (self._bundled, "litellm-bundled")):
             if not table:
                 continue
-            entry = table.get(key) or table.get(model)
+            entry = table.get(key)
+            bare = table.get(model)
+            if entry is None and bare and bare.get("litellm_provider") in (None, provider):
+                entry = bare  # a bare name only counts for the provider it belongs to
             if entry and (units := _units_from_litellm(entry)):
                 return Price(units, source)
         self._unpriced.add(key)
@@ -173,11 +201,13 @@ def counts_from_litellm(usage) -> Counts:
     cd = getattr(usage, "completion_tokens_details", None)
     cache_read = _int(getattr(pd, "cached_tokens", 0))
     cache_write = _int(getattr(usage, "cache_creation_input_tokens", None) or getattr(usage, "_cache_creation_input_tokens", 0))
+    ccd = getattr(usage, "cache_creation_token_details", None) or {}
+    write_1h = _int(ccd.get("ephemeral_1h_input_tokens") if isinstance(ccd, dict) else getattr(ccd, "ephemeral_1h_input_tokens", 0))
     audio_in = _int(getattr(pd, "audio_tokens", 0))
     audio_out = _int(getattr(cd, "audio_tokens", 0))
     prompt, completion = _int(usage.prompt_tokens), _int(usage.completion_tokens)
     return Counts(input=max(0, prompt - cache_read - cache_write - audio_in), cache_read=cache_read,
-                  cache_write=cache_write, output=max(0, completion - audio_out),
+                  cache_write=cache_write - write_1h, cache_write_1h=write_1h, output=max(0, completion - audio_out),
                   reasoning=_int(getattr(cd, "reasoning_tokens", 0)), audio_input=audio_in, audio_output=audio_out)
 
 

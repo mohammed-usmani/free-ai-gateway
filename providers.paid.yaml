@@ -64,7 +64,9 @@ realtime:
 # Prices you've verified, overriding LiteLLM's table (per token / second / character, USD).
 # Streaming voice (Deepgram, AssemblyAI, Cartesia, ElevenLabs) and Claude Opus 5.5 aren't in
 # LiteLLM's table: until you add them here their cost is recorded as unknown (NULL), and
-# /health lists them under pricing.unpriced. Example:
+# /health lists them under pricing.unpriced. Speech (TTS) is measured in characters, so
+# token-priced TTS (gpt-4o-mini-tts, Gemini TTS) needs a per_character rate you've worked out
+# from your bills to show a cost. Long-context tiers use "input@200000"-style keys. Example:
 #   deepgram/nova-3:
 #     - {effective_from: 2026-09-01, per_second: 0.000128}
 #   cartesia/sonic-3:

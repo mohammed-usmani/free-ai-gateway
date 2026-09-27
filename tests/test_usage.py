@@ -60,7 +60,7 @@ def test_totals_group_and_turns_by_conversation(store):
         store.close_turn(t)
     rows = store.totals(None, None, "model")
     assert rows == [{"provider": "openai", "model": "m", "turns": 3, "calls": 3, "input": 300, "output": 30,
-                     "cache_read": 0, "cache_write": 0, "reasoning": 0, "audio_input": 0, "audio_output": 0,
+                     "cache_read": 0, "cache_write": 0, "cache_write_1h": 0, "reasoning": 0, "audio_input": 0, "audio_output": 0,
                      "audio_cache_read": 0, "audio_seconds": 0.0, "characters": 0,
                      "cost": pytest.approx(3 * (100e-6 + 20e-6)), "unpriced_calls": 0}]
     assert len(store.turns("a")) == 2

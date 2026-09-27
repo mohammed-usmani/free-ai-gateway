@@ -98,6 +98,9 @@ make usage                   # usage totals by model
 make test                    # offline suite (fake upstream, no keys, no quota)
 ```
 
+If you run uvicorn on a port other than 8000, set `PORT` (or `GATEWAY_SELF_URL`) to match: the
+voice cascade calls the gateway's own chat endpoint there. The startup log prints the URL it uses.
+
 Docker: `docker compose up -d` (binds 127.0.0.1:8000; put a TLS proxy in front for remote use).
 Needs about 320 MB RAM idle.
 

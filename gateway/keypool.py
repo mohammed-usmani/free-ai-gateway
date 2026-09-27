@@ -19,7 +19,7 @@ def _key_id(key: str) -> str:
 
 
 def mask(key: str) -> str:
-    return f"{key[:3]}…{key[-4:]}" if len(key) > 8 else "…"
+    return f"…{key[-4:]}" if len(key) > 8 else "…"
 
 
 def cooldown_for(status: int | None, retry_after: float | None) -> float:

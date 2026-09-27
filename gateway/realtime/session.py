@@ -87,8 +87,12 @@ class RealtimeSession:
         except (WebSocketDisconnect, NoBackend):
             pass
         finally:
-            if self._watch:
+            if self._watch:  # it may be mid-swap: let it finish unwinding before stopping
                 self._watch.cancel()
+                try:
+                    await self._watch
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
             if self.backend:
                 await self.backend.stop()
 

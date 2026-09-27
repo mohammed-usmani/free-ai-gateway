@@ -19,14 +19,14 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from gateway.config import check_fallbacks, load_catalog, load_keys
+from gateway.config import check_fallbacks, known_providers, load_catalog, load_keys
 from gateway.keypool import KeyPool, mask
 from gateway.realtime.backends import RealtimeContext, realtime_options_for
 from gateway.realtime.session import RealtimeSession
 from gateway.modes import Answer, Modes
 from gateway.pricing import Counts, Pricer, counts_from_litellm
 from gateway.usage import UsageStore
-from gateway.router import Exhausted, Gateway, status_of
+from gateway.router import Exhausted, Gateway, UnknownModel, status_of
 
 
 # Request fields LiteLLM would treat as overrides of the configured deployment: they could
@@ -40,6 +40,16 @@ _NOT_FROM_CLIENTS = {
 
 def _client_params(body: dict) -> dict:
     return {k: v for k, v in body.items() if k not in _NOT_FROM_CLIENTS and not k.startswith("litellm")}
+
+
+async def _json_object(request: Request) -> dict:
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(400, "body must be JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "body must be a JSON object")
+    return body
 
 
 def _error(status: int, message: str, kind: str, headers: dict | None = None) -> JSONResponse:
@@ -105,8 +115,11 @@ def _audio_seconds(resp, data: bytes) -> float | None:
 
 
 def _stt_counts(resp, data: bytes) -> Counts:
-    """Token-billed transcription reports usage; per-second models are measured from the audio."""
+    """Token-billed transcription reports usage; per-second models report seconds or are
+    measured from the audio."""
     u = getattr(resp, "usage", None)
+    if getattr(u, "seconds", None):
+        return Counts(audio_seconds=float(u.seconds))
     tokens_in = getattr(u, "input_tokens", None) if u is not None else None
     if tokens_in:
         audio = getattr(getattr(u, "input_token_details", None), "audio_tokens", 0) or 0
@@ -116,7 +129,7 @@ def _stt_counts(resp, data: bytes) -> Counts:
 
 def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usage: UsageStore | None = None,
                lifespan=None) -> FastAPI:
-    app = FastAPI(title="Free AI Gateway", lifespan=lifespan)
+    app = FastAPI(title="Free AI Gateway", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     all_keys = modes.keys()
     usage = usage or UsageStore(":memory:", Pricer({}, bundled={}, fetch=None))
     app.state.usage = usage
@@ -135,8 +148,8 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
     async def http_error(_: Request, exc: HTTPException):
         return _error(exc.status_code, str(exc.detail), "invalid_request_error")
 
-    @app.exception_handler(KeyError)
-    async def unknown_model(_: Request, exc: KeyError):
+    @app.exception_handler(UnknownModel)
+    async def unknown_model(_: Request, exc: UnknownModel):
         return _error(404, f"model {exc.args[0]!r} is not configured or has no keys", "model_not_found")
 
     @app.exception_handler(Exhausted)
@@ -156,22 +169,25 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
 
     auth = [Depends(require_key)]
 
-    def begin(request: Request, endpoint: str, model: str) -> tuple[str, bool]:
-        """The turn this call belongs to: the realtime session's current turn when the call
-        comes from a cascade (x-gateway-session), else a new turn. Returns (turn_id, is_new)."""
-        session = request.headers.get("x-gateway-session")
-        if session and (turn := usage.session_turn(session)):
-            return turn, False
+    def begin(request: Request, endpoint: str, model: str) -> tuple[str, bool, str | None]:
+        """The turn this call belongs to. A realtime cascade's chat call carries its session's
+        private token: it joins the session's current turn, or (between turns) a new turn of
+        that session. Anything else opens its own turn. Returns (turn_id, closes_here, kind)."""
+        token = request.headers.get("x-gateway-session") if endpoint == "chat" else None
+        if token and (turn := usage.session_turn(token)):
+            return turn, False, "llm"
+        if token and (info := usage.session_of(token)):
+            return usage.open_turn(info[1], "realtime", "realtime", session_id=info[0]), True, "llm"
         mode, alias = modes.split(model)
-        return usage.open_turn(mode, endpoint, alias, request.headers.get("x-gateway-conversation-id")), True
+        return usage.open_turn(mode, endpoint, alias, request.headers.get("x-gateway-conversation-id")), True, None
 
-    def record(turn: tuple[str, bool], kind: str, answer: Answer, counts: Counts, started: float,
+    def record(turn: tuple[str, bool, str | None], kind: str, answer: Answer, counts: Counts, started: float,
                usage_obj=None, attempt: str = "ok"):
         """Never lets bookkeeping fail a request the provider already answered."""
-        turn_id, is_new = turn
+        turn_id, is_new, kind_override = turn
         provider, _, name = answer.group.partition("/")
         try:
-            usage.add(turn_id, kind if is_new else "llm", answer.mode, provider, name, counts, attempt=attempt,
+            usage.add(turn_id, kind_override or kind, answer.mode, provider, name, counts, attempt=attempt,
                       latency_ms=int((time.monotonic() - started) * 1000),
                       provider_cost=reported_cost(provider, usage_obj))
             if is_new:
@@ -181,7 +197,7 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
 
     @app.post("/v1/chat/completions", dependencies=auth)
     async def chat(request: Request):
-        body = _client_params(await request.json())
+        body = _client_params(await _json_object(request))
         model = body.pop("model", "")
         if body.get("stream"):
             body["stream_options"] = {**(body.get("stream_options") or {}), "include_usage": True}
@@ -205,7 +221,7 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
 
     @app.post("/v1/embeddings", dependencies=auth)
     async def embeddings(request: Request):
-        body = _client_params(await request.json())
+        body = _client_params(await _json_object(request))
         model = body.pop("model", "")
         started = time.monotonic()
         answer = await modes.call("aembedding", model, **body)
@@ -232,7 +248,7 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
 
     @app.post("/v1/audio/speech", dependencies=auth)
     async def speech(request: Request):
-        body = _client_params(await request.json())
+        body = _client_params(await _json_object(request))
         model = body.pop("model", "tts")
         # Voices are per provider: an alias uses each step's configured voice.
         if modes.is_alias(model):
@@ -254,30 +270,38 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
         try:
             return float(value)
         except ValueError:
-            return datetime.fromisoformat(value).replace(tzinfo=datetime.fromisoformat(value).tzinfo or timezone.utc).timestamp()
+            pass
+        try:
+            when = datetime.fromisoformat(value)
+        except ValueError:
+            raise HTTPException(400, f"not a date or timestamp: {value!r}")
+        return (when if when.tzinfo else when.replace(tzinfo=timezone.utc)).timestamp()
 
+    # Reads and reprices can scan many rows: keep them off the event loop.
     @app.get("/v1/usage", dependencies=auth)
     async def usage_totals(group_by: str = "model", start: str | None = Query(None, alias="from"),
                            end: str | None = Query(None, alias="to")):
         try:
-            return {"object": "list", "group_by": group_by, "data": usage.totals(_ts(start), _ts(end), group_by)}
+            rows = await asyncio.to_thread(usage.totals, _ts(start), _ts(end), group_by)
         except ValueError as exc:
             raise HTTPException(400, str(exc))
+        return {"object": "list", "group_by": group_by, "data": rows}
 
     @app.get("/v1/usage/turns", dependencies=auth)
     async def usage_turns(conversation_id: str | None = None, limit: int = 50):
-        return {"object": "list", "data": usage.turns(conversation_id, min(limit, 500))}
+        rows = await asyncio.to_thread(usage.turns, conversation_id, max(1, min(limit, 500)))
+        return {"object": "list", "data": rows}
 
     @app.get("/v1/usage/turns/{turn_id}", dependencies=auth)
     async def usage_turn(turn_id: str):
-        turn = usage.turn(turn_id)
+        turn = await asyncio.to_thread(usage.turn, turn_id)
         if not turn:
             raise HTTPException(404, "no such turn")
         return turn
 
     @app.post("/v1/usage/reprice", dependencies=auth)
     async def usage_reprice(start: str | None = Query(None, alias="from"), end: str | None = Query(None, alias="to")):
-        return {"repriced": usage.reprice(_ts(start), _ts(end))}
+        return {"repriced": await asyncio.to_thread(usage.reprice, _ts(start), _ts(end))}
 
     @app.get("/health")
     async def health():
@@ -312,7 +336,8 @@ def build() -> FastAPI:
              "paid": os.environ.get("PAID_PROVIDERS_FILE", root / "providers.paid.yaml")}
     catalogs = {m: load_catalog(f) for m, f in files.items() if Path(f).exists()}
     check_fallbacks(catalogs)
-    mode_keys = {m: load_keys(os.environ, prefix="" if m == "free" else "PAID_") for m in catalogs}
+    mode_keys = {m: known_providers(load_keys(os.environ, prefix="" if m == "free" else "PAID_"), catalogs.values())
+                 for m in catalogs}
     modes = Modes({m: Gateway(c, mode_keys[m]) for m, c in catalogs.items()})
     state_db = os.environ.get("STATE_DB") or os.environ.get("KEYPOOL_DB", "state.db")
     pool = KeyPool(state_db)
@@ -320,15 +345,19 @@ def build() -> FastAPI:
     usage = UsageStore(state_db, pricer)
     # The cascade's LLM step calls this gateway's own chat endpoint, so it gets fallback too.
     self_url = os.environ.get("GATEWAY_SELF_URL", f"http://127.0.0.1:{os.environ.get('PORT', '8000')}/v1")
+    log.info("voice cascade reaches the chat endpoint at %s (set PORT or GATEWAY_SELF_URL if that's wrong)", self_url)
 
     async def realtime(ws: WebSocket):
         session_id = f"sess_{uuid.uuid4().hex[:20]}"
-        options = realtime_options_for(ws.query_params.get("model", "realtime"), catalogs, mode_keys, pool,
-                                       self_url, gateway_key, RealtimeContext(usage, session_id))
+        token = secrets.token_urlsafe(24)
+        model = ws.query_params.get("model", "realtime")
+        usage.register_session(token, session_id, modes.split(model)[0])
+        options = realtime_options_for(model, catalogs, mode_keys, pool, self_url, gateway_key,
+                                       RealtimeContext(usage, session_id, token))
         try:
             await RealtimeSession(ws, options, pool, session_id=session_id).run()
         finally:
-            usage.set_session_turn(session_id, None)
+            usage.unregister_session(token)
 
     refresh_hours = float(os.environ.get("PRICE_REFRESH_HOURS", "6"))
 

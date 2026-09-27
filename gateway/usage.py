@@ -35,10 +35,17 @@ class UsageStore:
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(_SCHEMA)
+        have = {r[1] for r in self._db.execute("PRAGMA table_info(components)")}
+        for column in [*BUCKETS, "provider_cost", "unit_prices", "price_source", "cost", "latency_ms", "at", "attempt",
+                       "mode", "kind", "provider", "model"]:
+            if column not in have:  # databases from an older version
+                kind = "TEXT" if column in ("unit_prices", "price_source", "attempt", "mode", "kind", "provider", "model") else "REAL"
+                self._db.execute(f"ALTER TABLE components ADD COLUMN {column} {kind}")
         self._lock = threading.Lock()
         self.pricer = pricer
         self._clock = clock
-        self._sessions: dict[str, str] = {}
+        self._sessions: dict[str, str] = {}  # session token → current turn
+        self._session_info: dict[str, tuple[str, str]] = {}  # session token → (session id, mode)
 
     def _now(self) -> float:
         return self._clock()
@@ -71,10 +78,12 @@ class UsageStore:
         return row
 
     def _refresh_turn(self, turn_id):
-        total, missing = self._db.execute(
-            "SELECT COALESCE(SUM(cost), 0), SUM(cost IS NULL) FROM components WHERE turn_id = ?", (turn_id,)).fetchone()
+        total, missing, n = self._db.execute(
+            "SELECT SUM(cost), SUM(cost IS NULL), COUNT(*) FROM components WHERE turn_id = ?", (turn_id,)).fetchone()
+        # Nothing recorded is unknown, not free.
+        complete = n > 0 and not missing
         self._db.execute("UPDATE turns SET cost = ?, cost_complete = ? WHERE turn_id = ?",
-                         (total, int(not missing), turn_id))
+                         (total if n else None, int(complete), turn_id))
 
     def close_turn(self, turn_id):
         with self._lock:
@@ -82,15 +91,27 @@ class UsageStore:
             self._refresh_turn(turn_id)
 
     # --- realtime sessions: the cascade's LLM call lands on the session's current turn ---
+    # Keyed by a private per-session token (sent only on the loopback call), not the session
+    # id the client sees, so no other caller can attach usage to a session.
 
-    def set_session_turn(self, session_id: str, turn_id: str | None):
+    def register_session(self, token: str, session_id: str, mode: str):
+        self._session_info[token] = (session_id, mode)
+
+    def unregister_session(self, token: str):
+        self._session_info.pop(token, None)
+        self._sessions.pop(token, None)
+
+    def session_of(self, token: str) -> tuple[str, str] | None:
+        return self._session_info.get(token)
+
+    def set_session_turn(self, token: str, turn_id: str | None):
         if turn_id is None:
-            self._sessions.pop(session_id, None)
+            self._sessions.pop(token, None)
         else:
-            self._sessions[session_id] = turn_id
+            self._sessions[token] = turn_id
 
-    def session_turn(self, session_id: str) -> str | None:
-        return self._sessions.get(session_id)
+    def session_turn(self, token: str) -> str | None:
+        return self._sessions.get(token)
 
     # --- reads ---
 
