@@ -26,6 +26,9 @@ CREATE TABLE IF NOT EXISTS components (id INTEGER PRIMARY KEY, turn_id TEXT, kin
   model TEXT, attempt TEXT, {", ".join(f"{b} REAL" for b in BUCKETS)}, provider_cost REAL, unit_prices TEXT,
   price_source TEXT, cost REAL, latency_ms INTEGER, at REAL);
 CREATE INDEX IF NOT EXISTS components_turn ON components(turn_id);
+CREATE TABLE IF NOT EXISTS attempts (at REAL, mode TEXT, provider TEXT, model TEXT, key TEXT, ok INTEGER,
+  status INTEGER, error TEXT, latency_ms INTEGER, cache_hit INTEGER);
+CREATE INDEX IF NOT EXISTS attempts_at ON attempts(at);
 """
 
 
@@ -89,6 +92,13 @@ class UsageStore:
         with self._lock:
             self._db.execute("UPDATE turns SET ended_at = ? WHERE turn_id = ?", (self._now(), turn_id))
             self._refresh_turn(turn_id)
+
+    def log_attempt(self, row: dict):
+        """One provider attempt (success, failure or skipped step), for /v1/metrics."""
+        with self._lock:
+            self._db.execute("INSERT INTO attempts VALUES (?,?,?,?,?,?,?,?,?,?)",
+                             (row["at"], row["mode"], row["provider"], row["model"], row["key"], int(row["ok"]),
+                              row["status"], row["error"], row["latency_ms"], int(row["cache_hit"])))
 
     # --- realtime sessions: the cascade's LLM call lands on the session's current turn ---
     # Keyed by a private per-session token (sent only on the loopback call), not the session

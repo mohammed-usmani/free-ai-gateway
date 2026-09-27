@@ -77,6 +77,10 @@ class KeyPool:
             (provider, _key_id(key), until, status),
         )
 
+    def remaining(self, provider: str, key: str) -> float:
+        """Seconds this key stays cooled down (0 when usable)."""
+        return max(0.0, self._until(provider, [key])[key] - self._clock())
+
     def soonest(self, provider: str, keys: list[str]) -> float | None:
         """Seconds until the first cooling key recovers (0 if one is usable now)."""
         if not keys:

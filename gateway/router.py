@@ -54,7 +54,9 @@ class Exhausted(Exception):
 
 
 class Gateway:
-    def __init__(self, catalog: Catalog, keys: dict[str, list[str]]):
+    def __init__(self, catalog: Catalog, keys: dict[str, list[str]], mode: str = "free", observer=None):
+        self.mode = mode
+        self.observer = observer
         self.catalog = catalog
         self.settings = catalog.settings
         self.keys = keys
@@ -86,6 +88,8 @@ class Gateway:
                          else max((len(k) for k in keys.values()), default=1) - 1),
             retry_after=0,
         )
+        if observer:
+            observer.track(self.router, mode)
 
     def _deployments(self, group: str, step: Step) -> list[dict]:
         return [
@@ -124,6 +128,8 @@ class Gateway:
             ok, why = step_can(self._steps.get(group) or Step(*group.split("/", 1)), needs)
             if not ok:
                 reasons.append(f"{group}: {why}")
+                if self.observer:
+                    self.observer.skipped(self.mode, group, why)
                 continue
             try:
                 if kwargs.get("stream"):

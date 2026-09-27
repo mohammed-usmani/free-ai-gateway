@@ -24,6 +24,7 @@ from gateway.keypool import KeyPool, mask
 from gateway.realtime.backends import RealtimeContext, realtime_options_for
 from gateway.realtime.session import RealtimeSession
 from gateway.modes import Answer, Modes
+from gateway.observe import Observer
 from gateway.pricing import Counts, Pricer, counts_from_litellm
 from gateway.usage import UsageStore
 from gateway.router import Exhausted, Gateway, NoCapableStep, UnknownModel, status_of
@@ -342,11 +343,12 @@ def build() -> FastAPI:
     check_fallbacks(catalogs)
     mode_keys = {m: known_providers(load_keys(os.environ, prefix="" if m == "free" else "PAID_"), catalogs.values())
                  for m in catalogs}
-    modes = Modes({m: Gateway(c, mode_keys[m]) for m, c in catalogs.items()})
     state_db = os.environ.get("STATE_DB") or os.environ.get("KEYPOOL_DB", "state.db")
     pool = KeyPool(state_db)
     pricer = Pricer({m: c.prices for m, c in catalogs.items()})
     usage = UsageStore(state_db, pricer)
+    observer = Observer(pool, sink=usage.log_attempt)
+    modes = Modes({m: Gateway(c, mode_keys[m], mode=m, observer=observer) for m, c in catalogs.items()})
     # The cascade's LLM step calls this gateway's own chat endpoint, so it gets fallback too.
     self_url = os.environ.get("GATEWAY_SELF_URL", f"http://127.0.0.1:{os.environ.get('PORT', '8000')}/v1")
     log.info("voice cascade reaches the chat endpoint at %s (set PORT or GATEWAY_SELF_URL if that's wrong)", self_url)

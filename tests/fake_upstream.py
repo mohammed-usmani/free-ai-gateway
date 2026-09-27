@@ -10,8 +10,8 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-ERRORS = {"rl": 429, "auth": 401, "bad": 400, "down": 500, "noimg": 400, "ctx": 400}
-MESSAGES = {"noimg": "This model does not support image input.",
+ERRORS = {"day": 429, "rl": 429, "auth": 401, "bad": 400, "down": 500, "noimg": 400, "ctx": 400}
+MESSAGES = {"day": "Quota exceeded for metric: generate_content_free_tier_requests, quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier","noimg": "This model does not support image input.",
             "ctx": "This model's maximum context length is 8192 tokens. However, your messages resulted in 9000 tokens."}
 
 app = FastAPI()
