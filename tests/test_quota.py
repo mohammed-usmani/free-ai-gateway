@@ -55,11 +55,12 @@ def test_sambanova_day_headers():
 async def test_daily_limited_key_is_benched_and_stays_benched_after_restart(upstream_url, tmp_path):
     pool = KeyPool(str(tmp_path / "k.db"))
     obs = Observer(pool)
-    cat = Catalog({"chat": [Step("gemini", "g", {"api_base": upstream_url, "custom_llm_provider": "openai"})]},
+    cat = Catalog({"chat": [Step("gemini", "g", {"api_base": upstream_url, "custom_llm_provider": "openai"}),
+                            Step("openrouter", "backup", {"api_base": upstream_url})]},
                   RealtimeChain([], [], "chat", []))
 
     def make():
-        return Gateway(cat, {"gemini": ["day", "k2"]}, mode="free", observer=obs)
+        return Gateway(cat, {"gemini": ["day"], "openrouter": ["k2"]}, mode="free", observer=obs)
 
     g = make()
     for _ in range(3):
