@@ -13,13 +13,14 @@ import wave
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
 import litellm
 import openai
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
-from gateway.config import check_fallbacks, known_providers, load_catalog, load_keys
+from gateway.config import Step, check_fallbacks, known_providers, load_catalog, load_keys
 from gateway.keypool import KeyPool, mask
 from gateway.lock import SingleProcessLock
 from gateway.realtime.backends import RealtimeContext, realtime_options_for
@@ -28,7 +29,8 @@ from gateway.modes import Answer, Modes
 from gateway.observe import Observer
 from gateway.pricing import Counts, Pricer, counts_from_litellm
 from gateway.usage import UsageStore
-from gateway.router import Exhausted, Gateway, NoCapableStep, UnknownModel, status_of
+from gateway.router import Exhausted, Gateway, NoCapableStep, UnknownModel, should_fall_back, status_of
+from gateway.speech import MEDIA_TYPES, SpeechError, can_stream, open_stream
 
 
 # Request fields LiteLLM would treat as overrides of the configured deployment: they could
@@ -261,17 +263,91 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
 
     @app.post("/v1/audio/speech", dependencies=auth)
     async def speech(request: Request):
+        """Streams audio: tries each step until one starts sending, then relays chunks."""
         body = _client_params(await _json_object(request))
         model = body.pop("model", "tts")
-        # Voices are per provider: an alias uses each step's configured voice.
-        if modes.is_alias(model):
-            body.pop("voice", None)
+        text, fmt = body.get("input", ""), body.get("response_format") or "mp3"
         started = time.monotonic()
-        answer = await modes.call("aspeech", model, **body)
-        turn = begin(request, "tts", model)
-        record(turn, "tts", answer, Counts(characters=len(body.get("input", ""))), started)
-        return Response(answer.resp.content, media_type="audio/mpeg" if body.get("response_format", "mp3") == "mp3" else "application/octet-stream",
-                        headers={**headers(answer), "x-gateway-turn-id": turn[0]})
+        mode, name = modes.split(model)
+        target: str | None = model
+        skipped = 0
+        last: Exception | None = None
+        while target:
+            mode, name = modes.split(target)
+            gateway = modes.gateways[mode]
+            try:
+                groups = gateway.chain(name)
+            except UnknownModel:
+                groups = []
+            for group in groups:
+                step = gateway._steps.get(group) or Step(*group.split("/", 1))
+                voice = step.options.get("voice") if modes.is_alias(target) else (body.get("voice") or step.options.get("voice"))
+                try:
+                    first, rest, close = await _start_speech(gateway, mode, group, step, text, voice, fmt, body)
+                except HTTPException:
+                    raise
+                except Exception as exc:  # noqa: BLE001 — classified below
+                    if not should_fall_back(exc):
+                        raise HTTPException(400, scrub(str(exc)))
+                    last, skipped = exc, skipped + 1
+                    continue
+                answer = Answer(None, mode, group, skipped)
+                turn = begin(request, "tts", model)
+
+                async def relay():
+                    try:
+                        yield first
+                        async for chunk in rest:
+                            yield chunk
+                    finally:
+                        await close()
+                        record(turn, "tts", answer, Counts(characters=len(text)), started)
+
+                return StreamingResponse(relay(), media_type=MEDIA_TYPES.get(fmt, "application/octet-stream"),
+                                         headers={**headers(answer), "x-gateway-turn-id": turn[0]})
+            target = gateway.catalog.fallback_to.get(name)
+        if last is None:
+            raise UnknownModel(model)
+        raise Exhausted(last, modes.gateways[mode].settings.cooldown_seconds)
+
+    async def _start_speech(gateway, mode, group, step, text, voice, fmt, body):
+        """Returns (first chunk, remaining chunks, close) once the provider started sending."""
+        if can_stream(step.provider):
+            keys = gateway.keys.get(step.provider, [])
+            key = pool.pick(f"{mode}:{step.provider}", keys)
+            if not key:
+                raise SpeechError(429, "every key is cooling down")
+            http = httpx.AsyncClient(timeout=httpx.Timeout(60, connect=10))
+            try:
+                resp, chunks = await asyncio.wait_for(
+                    open_stream(http, step.provider, step.model, key, text, voice, fmt, step.options.get("api_base")),
+                    gateway.settings.first_byte_timeout)
+                first = await chunks.__anext__()
+            except SpeechError as exc:
+                pool.report(f"{mode}:{step.provider}", key, exc.status_code)
+                await http.aclose()
+                raise
+            except Exception:
+                pool.report(f"{mode}:{step.provider}", key, None)
+                await http.aclose()
+                raise
+
+            async def close():
+                await resp.aclose()
+                await http.aclose()
+
+            return first, chunks, close
+        resp = await gateway.router.aspeech(model=group, input=text, voice=voice,
+                                            **{k: v for k, v in body.items() if k not in ("input", "voice")})
+
+        async def nothing():
+            return
+            yield  # pragma: no cover
+
+        async def done():
+            return None
+
+        return resp.content, nothing(), done
 
     @app.get("/v1/models", dependencies=auth)
     async def models():

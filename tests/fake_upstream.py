@@ -79,7 +79,23 @@ async def speech(request: Request):
     key, err = _fail(request)
     if err:
         return err
-    return Response(b"RIFFfake-audio", media_type="audio/wav")
+    body = await request.json()
+
+    def chunks():
+        yield b"RIFF"
+        yield f"fake-audio:{body['model']}:{key}".encode()
+
+    return StreamingResponse(chunks(), media_type="audio/wav")
+
+
+@app.post("/v1/text-to-speech/{voice}/stream")
+async def elevenlabs_stream(voice: str, request: Request):
+    key = request.headers.get("xi-api-key", "")
+    calls.append((request.url.path, key))
+    if key in ERRORS:
+        return JSONResponse({"detail": {"status": "error"}}, ERRORS[key])
+    body = await request.json()
+    return StreamingResponse(iter([b"ID3", f"eleven:{voice}:{body['model_id']}".encode()]), media_type="audio/mpeg")
 
 
 def start() -> str:
