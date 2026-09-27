@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from gateway.app import create_app
 from gateway.config import Catalog, RealtimeChain, Step
 from gateway.keypool import KeyPool
+from gateway.modes import Modes
 from gateway.router import Gateway
 
 AUTH = {"Authorization": "Bearer gw-secret"}
@@ -22,7 +23,7 @@ def make_client(upstream_url, tmp_path):
             "tts": [Step("openai", "tts-1", {**o, "voice": "alloy"})],
         }
         catalog = Catalog(aliases, RealtimeChain([], [], "chat", []))
-        return TestClient(create_app(Gateway(catalog, keys), KeyPool(str(tmp_path / "k.db")), "gw-secret"))
+        return TestClient(create_app(Modes({"free": Gateway(catalog, keys)}), KeyPool(str(tmp_path / "k.db")), "gw-secret"))
     return make
 
 
@@ -102,7 +103,7 @@ def test_health_masks_keys_and_needs_no_auth(make_client):
     r = make_client({"groq": ["gsk_verysecret_1234"]}).get("/health")
     assert r.status_code == 200
     assert "gsk_verysecret_1234" not in r.text
-    assert r.json()["providers"]["groq"]["keys"] == 1
+    assert r.json()["modes"]["free"]["groq"]["keys"] == 1
 
 
 def test_realtime_requires_the_gateway_key_and_runs_a_session(upstream_url, tmp_path):
@@ -114,7 +115,7 @@ def test_realtime_requires_the_gateway_key_and_runs_a_session(upstream_url, tmp_
     pool = KeyPool(str(tmp_path / "k.db"))
     log = []
     gw = Gateway(Catalog({}, RealtimeChain([], [], "chat", [])), {})
-    app = create_app(gw, pool, "gw-secret",
+    app = create_app(Modes({"free": gw}), pool, "gw-secret",
                      realtime=lambda ws: RealtimeSession(ws, [option([FakeBackend("a", log)])], pool).run())
     client = TestClient(app)
     with pytest.raises(WebSocketDisconnect):
@@ -131,7 +132,7 @@ def test_build_reads_env(monkeypatch, tmp_path):
     monkeypatch.setenv("GROQ_API_KEYS", "g1,g2")
     monkeypatch.setenv("KEYPOOL_DB", str(tmp_path / "k.db"))
     client = TestClient(build())
-    assert client.get("/health").json()["providers"]["groq"]["keys"] == 2
+    assert client.get("/health").json()["modes"]["free"]["groq"]["keys"] == 2
     assert any(r.path == "/v1/realtime" for r in client.app.routes)
 
 
@@ -143,3 +144,16 @@ def test_clients_cannot_redirect_or_replace_provider_keys(make_client, upstream_
     assert r.status_code == 200
     assert r.json()["choices"][0]["message"]["content"] == "m1:g1"
     assert fake_upstream.calls[-1][1] == "g1"
+
+
+def test_mode_header_and_paid_prefix(upstream_url, tmp_path):
+    o = {"api_base": upstream_url}
+    free = Catalog({"chat": [Step("groq", "f", o)]}, RealtimeChain([], [], "chat", []))
+    paid = Catalog({"chat": [Step("openai", "p", o)]}, RealtimeChain([], [], "chat", []),
+                   fallback_to={"chat": "free/chat"})
+    modes = Modes({"free": Gateway(free, {"groq": ["g"]}), "paid": Gateway(paid, {"openai": ["down"]})})
+    client = TestClient(create_app(modes, KeyPool(str(tmp_path / "k.db")), "gw-secret"))
+    r = client.post("/v1/chat/completions", headers=AUTH,
+                    json={"model": "paid/chat", "messages": [{"role": "user", "content": "hi"}]})
+    assert (r.status_code, r.headers["x-gateway-mode"], r.headers["x-gateway-model"]) == (200, "free", "groq/f")
+    assert [m["id"] for m in client.get("/v1/models", headers=AUTH).json()["data"]] == ["chat", "paid/chat"]

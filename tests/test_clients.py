@@ -13,6 +13,7 @@ from gateway.app import create_app
 from gateway.config import Catalog, RealtimeChain, Step
 from gateway.keypool import KeyPool
 from gateway.realtime.session import RealtimeSession
+from gateway.modes import Modes
 from gateway.router import Gateway
 from tests.test_realtime_session import FakeBackend, option
 
@@ -24,7 +25,7 @@ def gateway_url(upstream_url, tmp_path_factory):
                        "embed-x": [Step("openai", "e1", o)]}, RealtimeChain([], [], "chat-fast", []))
     pool = KeyPool(str(tmp_path_factory.mktemp("k") / "k.db"))
     gw = Gateway(catalog, {"groq": ["rl"], "openrouter": ["o1"], "openai": ["e1"]})
-    app = create_app(gw, pool, "gw-secret",
+    app = create_app(Modes({"free": gw}), pool, "gw-secret",
                      realtime=lambda ws: RealtimeSession(ws, [option([FakeBackend("fake", [])])], pool).run())
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))

@@ -10,10 +10,11 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from gateway.config import load_catalog, load_keys
+from gateway.config import check_fallbacks, load_catalog, load_keys
 from gateway.keypool import KeyPool, mask
 from gateway.realtime.backends import realtime_options
 from gateway.realtime.session import RealtimeSession
+from gateway.modes import Answer, Modes
 from gateway.router import Exhausted, Gateway, status_of
 
 
@@ -34,9 +35,9 @@ def _error(status: int, message: str, kind: str, headers: dict | None = None) ->
     return JSONResponse({"error": {"message": message, "type": kind}}, status, headers)
 
 
-def create_app(gateway: Gateway, pool: KeyPool, gateway_key: str, realtime=None) -> FastAPI:
+def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None) -> FastAPI:
     app = FastAPI(title="Free AI Gateway")
-    all_keys = [k for keys in gateway.keys.values() for k in keys]
+    all_keys = modes.keys()
 
     def scrub(text: str) -> str:
         for key in all_keys:
@@ -67,8 +68,9 @@ def create_app(gateway: Gateway, pool: KeyPool, gateway_key: str, realtime=None)
         status = status_of(exc)
         return _error(status if isinstance(status, int) else 502, scrub(str(exc)), "provider_error")
 
-    def headers(group: str, skipped: int) -> dict:
-        return {"x-gateway-model": group, "x-gateway-fallbacks": str(skipped)}
+    def headers(answer: Answer) -> dict:
+        return {"x-gateway-mode": answer.mode, "x-gateway-model": answer.group,
+                "x-gateway-fallbacks": str(answer.skipped)}
 
     auth = [Depends(require_key)]
 
@@ -76,9 +78,10 @@ def create_app(gateway: Gateway, pool: KeyPool, gateway_key: str, realtime=None)
     async def chat(request: Request):
         body = _client_params(await request.json())
         model = body.pop("model", "")
-        resp, group, skipped = await gateway.call("acompletion", model, **body)
+        answer = await modes.call("acompletion", model, **body)
+        resp = answer.resp
         if not body.get("stream"):
-            return JSONResponse(resp.model_dump(), headers=headers(group, skipped))
+            return JSONResponse(resp.model_dump(), headers=headers(answer))
 
         async def sse():
             try:
@@ -88,14 +91,14 @@ def create_app(gateway: Gateway, pool: KeyPool, gateway_key: str, realtime=None)
                 yield f"data: {json.dumps({'error': {'message': scrub(str(exc)), 'type': 'provider_error'}})}\n\n"
             yield "data: [DONE]\n\n"
 
-        return StreamingResponse(sse(), media_type="text/event-stream", headers=headers(group, skipped))
+        return StreamingResponse(sse(), media_type="text/event-stream", headers=headers(answer))
 
     @app.post("/v1/embeddings", dependencies=auth)
     async def embeddings(request: Request):
         body = _client_params(await request.json())
         model = body.pop("model", "")
-        resp, group, skipped = await gateway.call("aembedding", model, **body)
-        return JSONResponse(resp.model_dump(), headers=headers(group, skipped))
+        answer = await modes.call("aembedding", model, **body)
+        return JSONResponse(answer.resp.model_dump(), headers=headers(answer))
 
     @app.post("/v1/audio/transcriptions", dependencies=auth)
     async def transcriptions(
@@ -106,31 +109,32 @@ def create_app(gateway: Gateway, pool: KeyPool, gateway_key: str, realtime=None)
     ):
         audio = (file.filename or "audio.wav", await file.read())
         extra = {k: v for k, v in {"language": language, "prompt": prompt}.items() if v}
-        resp, group, skipped = await gateway.call("atranscription", model, file=audio, **extra)
-        return JSONResponse({"text": resp.text}, headers=headers(group, skipped))
+        answer = await modes.call("atranscription", model, file=audio, **extra)
+        return JSONResponse({"text": answer.resp.text}, headers=headers(answer))
 
     @app.post("/v1/audio/speech", dependencies=auth)
     async def speech(request: Request):
         body = _client_params(await request.json())
         model = body.pop("model", "tts")
         # Voices are per provider: an alias uses each step's configured voice.
-        if model in gateway.aliases():
+        if modes.is_alias(model):
             body.pop("voice", None)
-        resp, group, skipped = await gateway.call("aspeech", model, **body)
-        return Response(resp.content, media_type="audio/mpeg" if body.get("response_format", "mp3") == "mp3" else "application/octet-stream",
-                        headers=headers(group, skipped))
+        answer = await modes.call("aspeech", model, **body)
+        return Response(answer.resp.content, media_type="audio/mpeg" if body.get("response_format", "mp3") == "mp3" else "application/octet-stream",
+                        headers=headers(answer))
 
     @app.get("/v1/models", dependencies=auth)
     async def models():
-        return {"object": "list", "data": [{"id": a, "object": "model", "owned_by": "gateway"} for a in gateway.aliases()]}
+        return {"object": "list", "data": [{"id": a, "object": "model", "owned_by": "gateway"} for a in modes.aliases()]}
 
     @app.get("/health")
     async def health():
         return {
             "status": "ok",
-            "aliases": gateway.aliases(),
-            "providers": {
-                p: {"keys": len(k), "realtime": pool.states(p, k)} for p, k in sorted(gateway.keys.items())
+            "aliases": modes.aliases(),
+            "modes": {
+                mode: {p: {"keys": len(k), "realtime": pool.states(f"{mode}:{p}", k)} for p, k in sorted(g.keys.items())}
+                for mode, g in modes.gateways.items()
             },
         }
 
@@ -150,9 +154,14 @@ def build() -> FastAPI:
     """uvicorn factory: `uvicorn gateway.app:build --factory`."""
     load_dotenv()
     gateway_key = os.environ["GATEWAY_API_KEY"]
-    keys = load_keys(os.environ)
-    catalog = load_catalog(os.environ.get("PROVIDERS_FILE", Path(__file__).parent.parent / "providers.free.yaml"))
-    gateway = Gateway(catalog, keys)
+    root = Path(__file__).parent.parent
+    files = {"free": os.environ.get("PROVIDERS_FILE", root / "providers.free.yaml"),
+             "paid": os.environ.get("PAID_PROVIDERS_FILE", root / "providers.paid.yaml")}
+    catalogs = {m: load_catalog(f) for m, f in files.items() if Path(f).exists()}
+    check_fallbacks(catalogs)
+    mode_keys = {m: load_keys(os.environ, prefix="" if m == "free" else "PAID_") for m in catalogs}
+    modes = Modes({m: Gateway(c, mode_keys[m]) for m, c in catalogs.items()})
+    catalog, keys = catalogs["free"], mode_keys["free"]
     pool = KeyPool(os.environ.get("KEYPOOL_DB", "keypool.db"))
     # The cascade's LLM step calls this gateway's own chat endpoint, so it gets fallback too.
     self_url = os.environ.get("GATEWAY_SELF_URL", f"http://127.0.0.1:{os.environ.get('PORT', '8000')}/v1")
@@ -161,4 +170,4 @@ def build() -> FastAPI:
     async def realtime(ws: WebSocket):
         await RealtimeSession(ws, options, pool).run()
 
-    return create_app(gateway, pool, gateway_key, realtime)
+    return create_app(modes, pool, gateway_key, realtime)

@@ -5,12 +5,13 @@ keys within a step (a failing key is cooled down and the retry lands on another)
 from step to step is ours: LiteLLM's own fallbacks also fire on 400s, which we must return.
 """
 
+import asyncio
+
 import litellm
 from litellm import Router
 
 from gateway.config import Catalog, Step, available
 
-COOLDOWN_SECONDS = 60
 
 
 def status_of(exc: Exception) -> int | None:
@@ -37,6 +38,7 @@ class Exhausted(Exception):
 class Gateway:
     def __init__(self, catalog: Catalog, keys: dict[str, list[str]]):
         self.catalog = catalog
+        self.settings = catalog.settings
         self.keys = keys
         self._chains: dict[str, list[str]] = {}
         model_list: list[dict] = []
@@ -56,10 +58,12 @@ class Gateway:
         self._registered = registered
         self.router = Router(
             model_list=model_list,
-            cooldown_time=COOLDOWN_SECONDS,
+            cooldown_time=self.settings.cooldown_seconds,
             allowed_fails=0,
-            # Retries land on the step's other keys, since the failed key is cooling down.
-            num_retries=max((len(k) for k in keys.values()), default=1) - 1,
+            # Free: retries land on the step's other keys (the failed key is cooling down).
+            # Paid: a fixed number of quick retries before the next provider.
+            num_retries=(self.settings.num_retries if self.settings.num_retries is not None
+                         else max((len(k) for k in keys.values()), default=1) - 1),
             retry_after=0,
         )
 
@@ -94,9 +98,11 @@ class Gateway:
         last: Exception | None = None
         for skipped, group in enumerate(self.chain(model)):
             try:
-                resp = await getattr(self.router, method)(model=group, **kwargs)
                 if kwargs.get("stream"):
-                    resp = await _prefetch(resp)
+                    resp = await asyncio.wait_for(self._first_chunk(method, group, kwargs),
+                                                  self.settings.first_byte_timeout)
+                else:
+                    resp = await getattr(self.router, method)(model=group, **kwargs)
                 return resp, group, skipped
             except Exception as exc:  # noqa: BLE001 — classified below
                 if not should_fall_back(exc):
@@ -104,8 +110,11 @@ class Gateway:
                 last = exc
         raise Exhausted(last, self._retry_after(model))
 
+    async def _first_chunk(self, method, group, kwargs):
+        return await _prefetch(await getattr(self.router, method)(model=group, **kwargs))
+
     def _retry_after(self, model: str) -> float | None:
-        return COOLDOWN_SECONDS if self._chains.get(model) or "/" in model else None
+        return self.settings.cooldown_seconds if self._chains.get(model) or "/" in model else None
 
     def aliases(self) -> list[str]:
         return list(self._chains)
