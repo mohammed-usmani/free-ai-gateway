@@ -1,0 +1,158 @@
+"""Usage per turn: one turn per caller request (or realtime response), made of priced
+components. Raw counts and the unit prices used are stored, so cost can be recomputed."""
+
+import json
+import sqlite3
+import threading
+import time
+import uuid
+from dataclasses import asdict, fields
+from datetime import datetime, timezone
+
+from gateway.pricing import Counts, Pricer, cost
+
+BUCKETS = [f.name for f in fields(Counts)]
+GROUPS = {
+    "model": ["c.provider", "c.model"], "provider": ["c.provider"], "mode": ["c.mode"], "alias": ["t.alias"],
+    "endpoint": ["t.endpoint"], "kind": ["c.kind"], "day": ["date(t.started_at, 'unixepoch')"],
+}
+
+_SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS turns (turn_id TEXT PRIMARY KEY, conversation_id TEXT, session_id TEXT, mode TEXT,
+  endpoint TEXT, alias TEXT, started_at REAL, ended_at REAL, cost REAL, cost_complete INTEGER);
+CREATE INDEX IF NOT EXISTS turns_started ON turns(started_at);
+CREATE INDEX IF NOT EXISTS turns_conversation ON turns(conversation_id);
+CREATE TABLE IF NOT EXISTS components (id INTEGER PRIMARY KEY, turn_id TEXT, kind TEXT, mode TEXT, provider TEXT,
+  model TEXT, attempt TEXT, {", ".join(f"{b} REAL" for b in BUCKETS)}, provider_cost REAL, unit_prices TEXT,
+  price_source TEXT, cost REAL, latency_ms INTEGER, at REAL);
+CREATE INDEX IF NOT EXISTS components_turn ON components(turn_id);
+"""
+
+
+class UsageStore:
+    def __init__(self, path: str, pricer: Pricer, clock=time.time):
+        self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self._db.row_factory = sqlite3.Row
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.executescript(_SCHEMA)
+        self._lock = threading.Lock()
+        self.pricer = pricer
+        self._clock = clock
+        self._sessions: dict[str, str] = {}
+
+    def _now(self) -> float:
+        return self._clock()
+
+    def open_turn(self, mode, endpoint, alias, conversation_id=None, session_id=None) -> str:
+        turn_id = f"turn_{uuid.uuid4().hex[:24]}"
+        with self._lock:
+            self._db.execute("INSERT INTO turns VALUES (?,?,?,?,?,?,?,NULL,NULL,NULL)",
+                             (turn_id, conversation_id, session_id, mode, endpoint, alias, self._now()))
+        return turn_id
+
+    def add(self, turn_id, kind, mode, provider, model, counts: Counts, attempt="ok",
+            latency_ms=None, provider_cost=None) -> dict:
+        at = self._now()
+        price = self.pricer.price(provider, model, mode, datetime.fromtimestamp(at, timezone.utc))
+        if provider_cost is not None:
+            value, source = float(provider_cost), "provider"
+        elif not any(asdict(counts).values()):
+            value, source = None, price.source if price else None  # nothing measured: unknown, not free
+        else:
+            value, source = cost(counts, price), price.source if price else None
+        row = {"turn_id": turn_id, "kind": kind, "mode": mode, "provider": provider, "model": model,
+               "attempt": attempt, **asdict(counts), "provider_cost": provider_cost,
+               "unit_prices": json.dumps(price.units) if price else None, "price_source": source,
+               "cost": value, "latency_ms": latency_ms, "at": at}
+        with self._lock:
+            self._db.execute(f"INSERT INTO components ({', '.join(row)}) VALUES ({', '.join('?' * len(row))})",
+                             list(row.values()))
+            self._refresh_turn(turn_id)
+        return row
+
+    def _refresh_turn(self, turn_id):
+        total, missing = self._db.execute(
+            "SELECT COALESCE(SUM(cost), 0), SUM(cost IS NULL) FROM components WHERE turn_id = ?", (turn_id,)).fetchone()
+        self._db.execute("UPDATE turns SET cost = ?, cost_complete = ? WHERE turn_id = ?",
+                         (total, int(not missing), turn_id))
+
+    def close_turn(self, turn_id):
+        with self._lock:
+            self._db.execute("UPDATE turns SET ended_at = ? WHERE turn_id = ?", (self._now(), turn_id))
+            self._refresh_turn(turn_id)
+
+    # --- realtime sessions: the cascade's LLM call lands on the session's current turn ---
+
+    def set_session_turn(self, session_id: str, turn_id: str | None):
+        if turn_id is None:
+            self._sessions.pop(session_id, None)
+        else:
+            self._sessions[session_id] = turn_id
+
+    def session_turn(self, session_id: str) -> str | None:
+        return self._sessions.get(session_id)
+
+    # --- reads ---
+
+    def turn(self, turn_id: str) -> dict | None:
+        t = self._db.execute("SELECT * FROM turns WHERE turn_id = ?", (turn_id,)).fetchone()
+        if not t:
+            return None
+        comps = self._db.execute("SELECT * FROM components WHERE turn_id = ? ORDER BY id", (turn_id,)).fetchall()
+        return {**_turn_dict(t), "components": [_component_dict(c) for c in comps]}
+
+    def turns(self, conversation_id: str | None = None, limit: int = 50) -> list[dict]:
+        sql, args = "SELECT turn_id FROM turns", []
+        if conversation_id:
+            sql, args = sql + " WHERE conversation_id = ?", [conversation_id]
+        rows = self._db.execute(sql + " ORDER BY started_at DESC LIMIT ?", [*args, limit]).fetchall()
+        return [self.turn(r["turn_id"]) for r in rows]
+
+    def totals(self, start: float | None, end: float | None, group_by: str) -> list[dict]:
+        if group_by not in GROUPS:
+            raise ValueError(f"group_by must be one of {', '.join(GROUPS)}")
+        cols = GROUPS[group_by]
+        names = [c.split(".")[-1] if "(" not in c else "day" for c in cols]
+        sums = ", ".join(f"SUM(c.{b}) AS {b}" for b in BUCKETS)
+        sql = (f"SELECT {', '.join(f'{c} AS {n}' for c, n in zip(cols, names))}, COUNT(DISTINCT t.turn_id) AS turns, "
+               f"COUNT(*) AS calls, {sums}, SUM(c.cost) AS cost, SUM(c.cost IS NULL) AS unpriced_calls "
+               f"FROM components c JOIN turns t USING (turn_id) WHERE t.started_at >= ? AND t.started_at < ? "
+               f"GROUP BY {', '.join(cols)} ORDER BY {', '.join(cols)}")
+        rows = self._db.execute(sql, (start or 0, end or 1e12)).fetchall()
+        return [_numbers(dict(r)) for r in rows]
+
+    def reprice(self, start: float | None, end: float | None) -> int:
+        """Recompute component cost from stored counts with today's prices (provider-reported
+        costs are kept). Returns how many components were repriced."""
+        rows = self._db.execute(
+            "SELECT c.* FROM components c JOIN turns t USING (turn_id) WHERE t.started_at >= ? AND t.started_at < ? "
+            "AND c.provider_cost IS NULL", (start or 0, end or 1e12)).fetchall()
+        with self._lock:
+            for r in rows:
+                counts = Counts(**{b: (r[b] or 0) for b in BUCKETS})
+                price = self.pricer.price(r["provider"], r["model"], r["mode"], datetime.fromtimestamp(r["at"], timezone.utc))
+                value = cost(counts, price) if any(asdict(counts).values()) else None
+                self._db.execute("UPDATE components SET cost = ?, unit_prices = ?, price_source = ? WHERE id = ?",
+                                 (value, json.dumps(price.units) if price else None, price.source if price else None, r["id"]))
+            for turn_id in {r["turn_id"] for r in rows}:
+                self._refresh_turn(turn_id)
+        return len(rows)
+
+
+def _numbers(d: dict) -> dict:
+    for b in BUCKETS:
+        if b in d and d[b] is not None:
+            d[b] = float(d[b]) if b == "audio_seconds" else int(d[b])
+    return d
+
+
+def _turn_dict(t) -> dict:
+    d = dict(t)
+    d["cost_complete"] = None if d["cost_complete"] is None else bool(d["cost_complete"])
+    return d
+
+
+def _component_dict(c) -> dict:
+    d = _numbers(dict(c))
+    d["unit_prices"] = json.loads(d["unit_prices"]) if d["unit_prices"] else None
+    return d

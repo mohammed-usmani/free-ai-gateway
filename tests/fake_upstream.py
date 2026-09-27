@@ -39,6 +39,10 @@ async def chat(request: Request):
                 chunk = {"id": "c", "object": "chat.completion.chunk", "created": 0, "model": body["model"],
                          "choices": [{"index": 0, "delta": {"role": "assistant", "content": part}, "finish_reason": None}]}
                 yield f"data: {json.dumps(chunk)}\n\n"
+            if (body.get("stream_options") or {}).get("include_usage"):
+                final = {"id": "c", "object": "chat.completion.chunk", "created": 0, "model": body["model"], "choices": [],
+                         "usage": {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8}}
+                yield f"data: {json.dumps(final)}\n\n"
             yield "data: [DONE]\n\n"
         return StreamingResponse(gen(), media_type="text/event-stream")
     return {"id": "c", "object": "chat.completion", "created": 0, "model": body["model"],

@@ -130,7 +130,8 @@ def test_build_reads_env(monkeypatch, tmp_path):
 
     monkeypatch.setenv("GATEWAY_API_KEY", "gw-secret")
     monkeypatch.setenv("GROQ_API_KEYS", "g1,g2")
-    monkeypatch.setenv("KEYPOOL_DB", str(tmp_path / "k.db"))
+    monkeypatch.setenv("STATE_DB", str(tmp_path / "state.db"))
+    monkeypatch.setenv("PRICE_REFRESH_HOURS", "0")
     client = TestClient(build())
     assert client.get("/health").json()["modes"]["free"]["groq"]["keys"] == 2
     assert any(r.path == "/v1/realtime" for r in client.app.routes)
@@ -157,3 +158,76 @@ def test_mode_header_and_paid_prefix(upstream_url, tmp_path):
                     json={"model": "paid/chat", "messages": [{"role": "user", "content": "hi"}]})
     assert (r.status_code, r.headers["x-gateway-mode"], r.headers["x-gateway-model"]) == (200, "free", "groq/f")
     assert [m["id"] for m in client.get("/v1/models", headers=AUTH).json()["data"]] == ["chat", "paid/chat"]
+
+
+@pytest.fixture
+def usage_client(upstream_url, tmp_path):
+    from gateway.pricing import Pricer
+    from gateway.usage import UsageStore
+
+    o = {"api_base": upstream_url}
+    catalog = Catalog({"chat": [Step("openai", "m", o)], "embed": [Step("openai", "e1", o)],
+                       "stt": [Step("openai", "whisper-1", o)], "tts": [Step("openai", "tts-1", {**o, "voice": "a"})]},
+                      RealtimeChain([], [], "chat", []))
+    pricer = Pricer({"free": {"openai/m": [{"effective_from": "2026-01-01", "input": 1e-6, "output": 2e-6}]}},
+                    bundled={}, fetch=None)
+    usage = UsageStore(str(tmp_path / "state.db"), pricer)
+    app = create_app(Modes({"free": Gateway(catalog, {"openai": ["k"]})}), KeyPool(str(tmp_path / "k.db")),
+                     "gw-secret", usage=usage)
+    return TestClient(app), usage
+
+
+def test_chat_turn_is_recorded_with_tokens_and_cost(usage_client):
+    client, usage = usage_client
+    r = client.post("/v1/chat/completions", headers={**AUTH, "x-gateway-conversation-id": "c1"},
+                    json={"model": "chat", "messages": [{"role": "user", "content": "hi"}]})
+    turn = client.get(f"/v1/usage/turns/{r.headers['x-gateway-turn-id']}", headers=AUTH).json()
+    comp = turn["components"][0]
+    assert (turn["conversation_id"], comp["kind"], comp["provider"], comp["model"]) == ("c1", "chat", "openai", "m")
+    assert (comp["input"], comp["output"]) == (1, 1)
+    assert comp["cost"] == pytest.approx(1e-6 + 2e-6)
+
+
+def test_streamed_chat_records_usage_from_the_final_chunk(usage_client):
+    client, usage = usage_client
+    r = client.post("/v1/chat/completions", headers=AUTH,
+                    json={"model": "chat", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200
+    comp = usage.turn(r.headers["x-gateway-turn-id"])["components"][0]
+    assert (comp["input"], comp["output"]) == (3, 5)
+
+
+def test_session_header_attaches_to_the_sessions_turn(usage_client):
+    client, usage = usage_client
+    t = usage.open_turn("free", "realtime", "realtime", session_id="s9")
+    usage.set_session_turn("s9", t)
+    r = client.post("/v1/chat/completions", headers={**AUTH, "x-gateway-session": "s9"},
+                    json={"model": "chat", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.headers["x-gateway-turn-id"] == t
+    assert [c["kind"] for c in usage.turn(t)["components"]] == ["llm"]
+
+
+def test_embeddings_speech_and_transcription_are_recorded(usage_client):
+    client, usage = usage_client
+    e = client.post("/v1/embeddings", headers=AUTH, json={"model": "embed", "input": "a"})
+    s = client.post("/v1/audio/speech", headers=AUTH, json={"model": "tts", "input": "hello"})
+    import io, wave
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(8000); w.writeframes(b"\x00\x00" * 16000)
+    t = client.post("/v1/audio/transcriptions", headers=AUTH, data={"model": "stt"},
+                    files={"file": ("a.wav", buf.getvalue(), "audio/wav")})
+    comps = {r.headers["x-gateway-turn-id"]: usage.turn(r.headers["x-gateway-turn-id"])["components"][0]
+             for r in (e, s, t)}
+    assert comps[e.headers["x-gateway-turn-id"]]["input"] == 1
+    assert comps[s.headers["x-gateway-turn-id"]]["characters"] == 5
+    assert comps[t.headers["x-gateway-turn-id"]]["audio_seconds"] == pytest.approx(2.0)
+
+
+def test_usage_totals_endpoint(usage_client):
+    client, _ = usage_client
+    client.post("/v1/chat/completions", headers=AUTH, json={"model": "chat", "messages": [{"role": "user", "content": "x"}]})
+    rows = client.get("/v1/usage?group_by=mode", headers=AUTH).json()["data"]
+    assert rows[0]["mode"] == "free" and rows[0]["calls"] == 1
+    assert client.get("/v1/usage?group_by=bogus", headers=AUTH).status_code == 400
+    assert client.get("/v1/usage").status_code == 401
