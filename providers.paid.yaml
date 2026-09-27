@@ -82,3 +82,10 @@ providers:
   deepgram: {trains_on_data: opt-out}
   cartesia: {trains_on_data: opt-out}
   elevenlabs: {trains_on_data: opt-out}
+
+# Anthropic-format clients (Claude Code, the Anthropic SDK) send Claude model names to
+# /v1/messages; map them to aliases. Globs, first match wins.
+model_map:
+  "claude-opus-*": paid/chat-best
+  "claude-haiku-*": paid/chat-fast
+  "claude-*": paid/chat-smart

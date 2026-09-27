@@ -68,6 +68,7 @@ class Catalog:
     prices: dict[str, list[dict]] = field(default_factory=dict)
     privacy: dict[str, str] = field(default_factory=dict)  # provider → trains_on_data: no | opt-out | yes
     cache_aliases: set[str] = field(default_factory=set)  # aliases with `cache: true`
+    model_map: dict[str, str] = field(default_factory=dict)  # glob → "<mode>/<alias>" for /v1/messages
 
     def is_private(self, provider: str) -> bool:
         """Only providers known not to train on API data count as private."""
@@ -122,6 +123,7 @@ def load_catalog(path: str | Path) -> Catalog:
         fallback_to=fallback_to,
         prices=_check_prices(data.get("prices") or {}),
         cache_aliases=cached,
+        model_map=dict(data.get("model_map") or {}),
         privacy={p: _privacy_word((v or {}).get("trains_on_data")) for p, v in (data.get("providers") or {}).items()},
     )
 

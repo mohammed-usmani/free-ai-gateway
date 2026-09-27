@@ -70,3 +70,8 @@ providers:
   openrouter: {trains_on_data: "yes"}     # most free endpoints may train or publish
   cohere: {trains_on_data: "yes"}
   assemblyai: {trains_on_data: "yes"}     # free users can't opt out
+
+# /v1/messages model names → aliases (paid's map, when present, wins).
+model_map:
+  "claude-haiku-*": chat-fast
+  "claude-*": chat-smart

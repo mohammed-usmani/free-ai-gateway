@@ -1,5 +1,6 @@
 """Free and paid gateways behind one model namespace: `paid/<alias>`, `free/<alias>`, bare = free."""
 
+import fnmatch
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,6 +26,16 @@ class Modes:
         if head in self.gateways and rest:
             return head, rest
         return DEFAULT_MODE, model
+
+    def map_model(self, model: str) -> str:
+        """Anthropic-client model names (e.g. Claude Code's claude-*) → a configured alias."""
+        if self.is_alias(model):
+            return model
+        for gateway in reversed(list(self.gateways.values())):  # paid's map wins over free's
+            for pattern, target in gateway.catalog.model_map.items():
+                if fnmatch.fnmatchcase(model, pattern):
+                    return target
+        return model
 
     def is_alias(self, model: str) -> bool:
         mode, name = self.split(model)

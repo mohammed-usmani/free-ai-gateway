@@ -84,7 +84,14 @@ def _health_summary(report: list[dict]) -> dict:
                            for r in report if r["flags"] and r["flags"] != ["unpriced"]]}
 
 
-def _error(status: int, message: str, kind: str, headers: dict | None = None) -> JSONResponse:
+_ANTHROPIC_ERRORS = {400: "invalid_request_error", 401: "authentication_error", 403: "permission_error",
+                     404: "not_found_error", 429: "rate_limit_error", 503: "overloaded_error"}
+
+
+def _error(status: int, message: str, kind: str, headers: dict | None = None, request: Request | None = None) -> JSONResponse:
+    if request is not None and request.url.path.startswith("/v1/messages"):  # Anthropic clients parse this shape
+        body = {"type": "error", "error": {"type": _ANTHROPIC_ERRORS.get(status, "api_error"), "message": message}}
+        return JSONResponse(body, status, headers)
     return JSONResponse({"error": {"message": message, "type": kind}}, status, headers)
 
 
@@ -146,6 +153,13 @@ def _responses_counts(u) -> Counts:
                   output=get(u, "output_tokens") or 0, reasoning=reasoning)
 
 
+def _anthropic_counts(u) -> Counts:
+    """Anthropic usage is net: input_tokens excludes cache reads and writes."""
+    u = u or {}
+    return Counts(input=int(u.get("input_tokens") or 0), cache_read=int(u.get("cache_read_input_tokens") or 0),
+                  cache_write=int(u.get("cache_creation_input_tokens") or 0), output=int(u.get("output_tokens") or 0))
+
+
 def _was_cached(resp) -> bool:
     return bool((getattr(resp, "_hidden_params", None) or {}).get("cache_hit"))
 
@@ -187,36 +201,37 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
         return text
 
     def require_key(request: Request):
-        header = request.headers.get("authorization", "")
-        if not secrets.compare_digest(header.encode(), f"Bearer {gateway_key}".encode()):
+        # Bearer for OpenAI-style clients, x-api-key for Anthropic-style ones.
+        given = request.headers.get("authorization", "").removeprefix("Bearer ") or request.headers.get("x-api-key", "")
+        if not secrets.compare_digest(given.encode(), gateway_key.encode()):
             raise HTTPException(401, "invalid gateway key")
 
     @app.exception_handler(HTTPException)
-    async def http_error(_: Request, exc: HTTPException):
-        return _error(exc.status_code, str(exc.detail), "invalid_request_error")
+    async def http_error(request: Request, exc: HTTPException):
+        return _error(exc.status_code, str(exc.detail), "invalid_request_error", request=request)
 
     @app.exception_handler(UnknownModel)
-    async def unknown_model(_: Request, exc: UnknownModel):
-        return _error(404, f"model {exc.args[0]!r} is not configured or has no keys", "model_not_found")
+    async def unknown_model(request: Request, exc: UnknownModel):
+        return _error(404, f"model {exc.args[0]!r} is not configured or has no keys", "model_not_found", request=request)
 
     @app.exception_handler(NoPrivateProvider)
-    async def no_private(_: Request, exc: NoPrivateProvider):
-        return _error(503, str(exc), "no_private_provider")
+    async def no_private(request: Request, exc: NoPrivateProvider):
+        return _error(503, str(exc), "no_private_provider", request=request)
 
     @app.exception_handler(NoCapableStep)
-    async def no_capable_step(_: Request, exc: NoCapableStep):
-        return _error(400, str(exc), "unsupported_request")
+    async def no_capable_step(request: Request, exc: NoCapableStep):
+        return _error(400, str(exc), "unsupported_request", request=request)
 
     @app.exception_handler(Exhausted)
-    async def exhausted(_: Request, exc: Exhausted):
+    async def exhausted(request: Request, exc: Exhausted):
         headers = {"retry-after": str(int(exc.retry_after))} if exc.retry_after else None
-        return _error(503, scrub(f"every provider failed; last error: {exc}"), "all_providers_failed", headers)
+        return _error(503, scrub(f"every provider failed; last error: {exc}"), "all_providers_failed", headers, request)
 
     # Exception subclasses (not bare Exception) so Starlette answers instead of re-raising.
     @app.exception_handler(openai.APIError)
-    async def provider_error(_: Request, exc: Exception):
+    async def provider_error(request: Request, exc: Exception):
         status = status_of(exc)
-        return _error(status if isinstance(status, int) else 502, scrub(str(exc)), "provider_error")
+        return _error(status if isinstance(status, int) else 502, scrub(str(exc)), "provider_error", request=request)
 
     def headers(answer: Answer) -> dict:
         h = {"x-gateway-mode": answer.mode, "x-gateway-model": answer.group, "x-gateway-fallbacks": str(answer.skipped)}
@@ -358,6 +373,42 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
         if not await asyncio.to_thread(responses.delete, response_id):
             raise HTTPException(404, "no such stored response")
         return {"id": response_id, "object": "response", "deleted": True}
+
+    @app.post("/v1/messages", dependencies=auth)
+    async def messages(request: Request):
+        """Anthropic Messages API (Claude Code, the Anthropic SDK) on any provider."""
+        body = _client_params(await _json_object(request))
+        model = modes.map_model(body.pop("model", ""))
+        started = time.monotonic()
+        answer = await modes.call("aanthropic_messages", model, private=_private(request), **body,
+                                  **cache_args(request, model))
+        turn = begin(request, "messages", model)
+        if not body.get("stream"):
+            data = answer.resp if isinstance(answer.resp, dict) else answer.resp.model_dump()
+            data = {k: v for k, v in data.items() if not k.startswith("_")}
+            record(turn, "messages", answer, _anthropic_counts(data.get("usage")), started)
+            return JSONResponse(data, headers={**headers(answer), "x-gateway-turn-id": turn[0]})
+
+        async def relay():
+            seen = {}
+            try:
+                async for chunk in answer.resp:
+                    raw = chunk if isinstance(chunk, (bytes, str)) else json.dumps(chunk)
+                    text = raw.decode() if isinstance(raw, bytes) else raw
+                    for line in text.splitlines():  # usage arrives on message_start / message_delta
+                        if line.startswith("data: ") and '"usage"' in line:
+                            try:
+                                event = json.loads(line[6:])
+                                usage = event.get("usage") or (event.get("message") or {}).get("usage") or {}
+                                seen.update({k: v for k, v in usage.items() if v})
+                            except ValueError:
+                                pass
+                    yield raw
+            finally:
+                record(turn, "messages", answer, _anthropic_counts(seen), started)
+
+        return StreamingResponse(relay(), media_type="text/event-stream",
+                                 headers={**headers(answer), "x-gateway-turn-id": turn[0]})
 
     @app.post("/v1/audio/transcriptions", dependencies=auth)
     async def transcriptions(
