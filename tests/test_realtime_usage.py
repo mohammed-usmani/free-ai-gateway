@@ -162,3 +162,42 @@ def test_openai_realtime_backend_builds(tmp_path, usage):
     backend = realtime_options(chain, {"openai": ["k"]}, pool, "http://x/v1", "g", mode="paid", ctx=RealtimeContext(usage, "s"))[0]()
     processors = backend._build(backend, {"instructions": "hi", "tools": []}, None)
     assert type(processors[0]).__name__ == "OpenAIRealtimeLLMService"
+
+
+class HalfAnswer(FrameProcessor):
+    """Starts speaking and reports usage, then the call ends before the response finishes."""
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame):
+            await self.push_frame(TTSStartedFrame())
+            usage = LLMTokenUsage(prompt_tokens=10, completion_tokens=4, total_tokens=14)
+            await self.push_frame(MetricsFrame(data=[LLMUsageMetricsData(processor=self.name, model="live", value=usage)]))
+        else:
+            await self.push_frame(frame, direction)
+
+
+async def test_hang_up_mid_response_still_records_the_turn(usage):
+    acct = TurnAccounting(usage, "sess3", "paid")
+
+    def build(backend, config, emit):
+        model = HalfAnswer()
+        acct.register(model, "s2s", "gemini", "live")
+        return [model, EventSink(emit, acct)]
+
+    backend = PipecatBackend("g", "paid:gemini", "k", build, accounting=acct)
+    events = []
+
+    async def emit(e):
+        events.append(e)
+
+    await backend.start({}, emit)
+    await asyncio.sleep(0.2)
+    await backend.send_audio(b"\x00")
+    await asyncio.sleep(0.3)
+    backend.fail(429)
+    await backend.stop()
+    turns = usage.turns()
+    assert len(turns) == 1 and turns[0]["ended_at"] is not None
+    comp = turns[0]["components"][0]
+    assert (comp["kind"], comp["input"], comp["attempt"]) == ("s2s", 10, "failed")

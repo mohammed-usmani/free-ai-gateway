@@ -231,3 +231,76 @@ def test_usage_totals_endpoint(usage_client):
     assert rows[0]["mode"] == "free" and rows[0]["calls"] == 1
     assert client.get("/v1/usage?group_by=bogus", headers=AUTH).status_code == 400
     assert client.get("/v1/usage").status_code == 401
+
+
+@pytest.fixture
+def priced_client(upstream_url, tmp_path):
+    from gateway.pricing import Pricer
+    from gateway.usage import UsageStore
+
+    o = {"api_base": upstream_url}
+    catalog = Catalog({"chat": [Step("openai", "gpt-4o-mini", o)]}, RealtimeChain([], [], "chat", []))
+    pricer = Pricer({"free": {"openai/gpt-4o-mini": [{"effective_from": "2026-01-01", "input": 1e-6, "output": 2e-6}]}},
+                    bundled={}, fetch=None)
+    usage = UsageStore(str(tmp_path / "state.db"), pricer)
+    app = create_app(Modes({"free": Gateway(catalog, {"openai": ["k"]})}), KeyPool(str(tmp_path / "k.db")),
+                     "gw-secret", usage=usage)
+    return TestClient(app), usage
+
+
+def test_litellm_computed_stream_cost_is_not_taken_as_provider_cost(priced_client):
+    client, usage = priced_client
+    r = client.post("/v1/chat/completions", headers=AUTH,
+                    json={"model": "chat", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+    comp = usage.turn(r.headers["x-gateway-turn-id"])["components"][0]
+    assert comp["price_source"] == "override"
+    assert comp["cost"] == pytest.approx(3 * 1e-6 + 5 * 2e-6)
+
+
+def test_usage_recording_failure_does_not_fail_the_request(priced_client, monkeypatch):
+    client, usage = priced_client
+
+    def boom(*a, **k):
+        raise KeyError("effective_from")
+
+    monkeypatch.setattr(usage, "add", boom)
+    r = client.post("/v1/chat/completions", headers=AUTH,
+                    json={"model": "chat", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200
+
+
+async def test_interrupted_stream_records_estimated_usage():
+    from gateway.app import stream_and_record
+
+    class Chunk:
+        def __init__(self, text):
+            self.usage = None
+            self.choices = [type("C", (), {"delta": type("D", (), {"content": text})()})()]
+
+        def model_dump_json(self):
+            return "{}"
+
+    closed = []
+
+    class Upstream:
+        def __init__(self):
+            self._it = iter([Chunk("hello "), Chunk("world"), Chunk("!")])
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._it)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        async def aclose(self):
+            closed.append(True)
+
+    recorded = []
+    gen = stream_and_record(Upstream(), lambda usage, text: recorded.append((usage, text)), scrub=str)
+    await gen.__anext__()
+    await gen.aclose()  # client went away after the first chunk
+    assert recorded == [(None, "hello ")]
+    assert closed == [True]

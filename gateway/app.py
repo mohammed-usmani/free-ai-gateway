@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import logging
 from contextlib import asynccontextmanager
 import json
 import os
@@ -12,6 +13,7 @@ import wave
 from datetime import datetime, timezone
 from pathlib import Path
 
+import litellm
 import openai
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
@@ -42,6 +44,54 @@ def _client_params(body: dict) -> dict:
 
 def _error(status: int, message: str, kind: str, headers: dict | None = None) -> JSONResponse:
     return JSONResponse({"error": {"message": message, "type": kind}}, status, headers)
+
+
+log = logging.getLogger(__name__)
+
+# Providers whose responses carry the real charge. LiteLLM also stamps its *own* estimate into
+# usage.cost on streams, so for anyone else that field is not the provider's number.
+PROVIDER_REPORTED_COST = {"openrouter"}
+
+
+def reported_cost(provider: str, usage) -> float | None:
+    value = getattr(usage, "cost", None) if provider in PROVIDER_REPORTED_COST else None
+    if isinstance(value, dict):
+        value = value.get("total_cost")
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+async def stream_and_record(resp, on_done, scrub):
+    """SSE out of a committed LiteLLM stream. `on_done(usage, text)` runs however the stream
+    ends — finished, failed, or the client went away (then usage is None and the text so far
+    is used to estimate). The upstream stream is closed so the provider stops generating."""
+    final_usage, text = None, []
+    try:
+        async for chunk in resp:
+            if getattr(chunk, "usage", None):
+                final_usage = chunk.usage
+            for choice in getattr(chunk, "choices", None) or []:
+                if content := getattr(getattr(choice, "delta", None), "content", None):
+                    text.append(content)
+            yield f"data: {chunk.model_dump_json()}\n\n"
+    except Exception as exc:  # noqa: BLE001 — committed stream: report, don't splice
+        yield f"data: {json.dumps({'error': {'message': scrub(str(exc)), 'type': 'provider_error'}})}\n\n"
+    finally:
+        if aclose := getattr(resp, "aclose", None):
+            try:
+                await aclose()
+            except Exception:  # noqa: BLE001
+                pass
+        on_done(final_usage, "".join(text))
+    yield "data: [DONE]\n\n"
+
+
+def _estimate(model: str, messages, text: str) -> Counts:
+    try:
+        prompt = litellm.token_counter(model=model, messages=messages or [])
+        output = litellm.token_counter(model=model, text=text) if text else 0
+    except Exception:  # noqa: BLE001 — an estimate is best effort
+        return Counts()
+    return Counts(input=prompt, output=output)
 
 
 def _audio_seconds(resp, data: bytes) -> float | None:
@@ -115,13 +165,19 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
         mode, alias = modes.split(model)
         return usage.open_turn(mode, endpoint, alias, request.headers.get("x-gateway-conversation-id")), True
 
-    def record(turn: tuple[str, bool], kind: str, answer: Answer, counts: Counts, started: float, provider_cost=None):
+    def record(turn: tuple[str, bool], kind: str, answer: Answer, counts: Counts, started: float,
+               usage_obj=None, attempt: str = "ok"):
+        """Never lets bookkeeping fail a request the provider already answered."""
         turn_id, is_new = turn
         provider, _, name = answer.group.partition("/")
-        usage.add(turn_id, kind if is_new else "llm", answer.mode, provider, name, counts,
-                  latency_ms=int((time.monotonic() - started) * 1000), provider_cost=provider_cost)
-        if is_new:
-            usage.close_turn(turn_id)
+        try:
+            usage.add(turn_id, kind if is_new else "llm", answer.mode, provider, name, counts, attempt=attempt,
+                      latency_ms=int((time.monotonic() - started) * 1000),
+                      provider_cost=reported_cost(provider, usage_obj))
+            if is_new:
+                usage.close_turn(turn_id)
+        except Exception:  # noqa: BLE001
+            log.exception("could not record usage for turn %s", turn_id)
 
     @app.post("/v1/chat/completions", dependencies=auth)
     async def chat(request: Request):
@@ -134,24 +190,17 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
         resp = answer.resp
         turn = begin(request, "chat", model)
         if not body.get("stream"):
-            record(turn, "chat", answer, counts_from_litellm(resp.usage), started, getattr(resp.usage, "cost", None))
+            record(turn, "chat", answer, counts_from_litellm(resp.usage), started, resp.usage)
             return JSONResponse(resp.model_dump(), headers={**headers(answer), "x-gateway-turn-id": turn[0]})
 
-        async def sse():
-            final_usage = None
-            try:
-                async for chunk in resp:
-                    if getattr(chunk, "usage", None):
-                        final_usage = chunk.usage
-                    yield f"data: {chunk.model_dump_json()}\n\n"
-            except Exception as exc:  # noqa: BLE001 — committed stream: report, don't splice
-                yield f"data: {json.dumps({'error': {'message': scrub(str(exc)), 'type': 'provider_error'}})}\n\n"
-            finally:  # runs on client disconnect too: what was generated is billed
-                counts = counts_from_litellm(final_usage) if final_usage else Counts()
-                record(turn, "chat", answer, counts, started, getattr(final_usage, "cost", None))
-            yield "data: [DONE]\n\n"
+        def on_done(final_usage, text: str):
+            if final_usage:
+                record(turn, "chat", answer, counts_from_litellm(final_usage), started, final_usage)
+            else:  # interrupted: the provider still bills what it generated, so estimate it
+                record(turn, "chat", answer, _estimate(answer.group, body.get("messages"), text), started,
+                       attempt="interrupted")
 
-        return StreamingResponse(sse(), media_type="text/event-stream",
+        return StreamingResponse(stream_and_record(resp, on_done, scrub), media_type="text/event-stream",
                                  headers={**headers(answer), "x-gateway-turn-id": turn[0]})
 
     @app.post("/v1/embeddings", dependencies=auth)

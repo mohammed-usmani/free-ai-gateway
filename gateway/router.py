@@ -125,8 +125,12 @@ async def _prefetch(stream):
     first = await iterator.__anext__()
 
     async def replay():
-        yield first
-        async for chunk in iterator:
-            yield chunk
+        try:
+            yield first
+            async for chunk in iterator:
+                yield chunk
+        finally:
+            if aclose := getattr(iterator, "aclose", None):
+                await aclose()
 
     return replay()

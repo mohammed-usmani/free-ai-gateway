@@ -118,3 +118,13 @@ def test_shipped_paid_catalog_loads_and_fallbacks_are_sound():
     assert paid.realtime.fallback_to == "free/realtime"
     embeds = [a for a in paid.aliases if a.startswith("embed-")]
     assert embeds and all(len(paid.aliases[a]) == 1 and a not in paid.fallback_to for a in embeds)
+
+
+def test_bad_price_entries_are_rejected_at_load(tmp_path):
+    bad = CATALOG.replace("- {effective_from: 2026-01-01, input: 0.000001, output: 0.000002}",
+                          "- {input: 0.000001}")
+    with pytest.raises(ValueError, match="effective_from"):
+        load_catalog(write(tmp_path, bad))
+    bad = CATALOG.replace("output: 0.000002}", "output: cheap}")
+    with pytest.raises(ValueError, match="output"):
+        load_catalog(write(tmp_path, bad))

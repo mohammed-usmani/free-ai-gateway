@@ -99,3 +99,9 @@ def test_voice_units():
                 bundled={}, fetch=None)
     assert cost(Counts(audio_seconds=60), pr.price("deepgram", "nova-3", "paid", AT)) == pytest.approx(0.006)
     assert cost(Counts(characters=1000), pr.price("cartesia", "sonic-3", "paid", AT)) == pytest.approx(0.03)
+
+
+def test_gemini_live_reasoning_is_billed_as_output():
+    u = LLMTokenUsage(prompt_tokens=10, completion_tokens=5, total_tokens=35, reasoning_tokens=20)
+    assert counts_from_pipecat(u, net=False, reasoning_in_output=False).output == 25
+    assert counts_from_pipecat(u, net=False).output == 5

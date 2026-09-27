@@ -3,6 +3,7 @@
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 import yaml
@@ -71,6 +72,18 @@ def _steps(items: list[dict]) -> list[Step]:
     return [Step(i["provider"], i["model"], {k: v for k, v in i.items() if k not in ("provider", "model")}) for i in items]
 
 
+def _check_prices(prices: dict) -> dict:
+    for key, entries in prices.items():
+        for entry in entries:
+            if "effective_from" not in entry:
+                raise ValueError(f"prices.{key}: every entry needs effective_from")
+            date.fromisoformat(str(entry["effective_from"]))
+            for field_name, value in entry.items():
+                if field_name != "effective_from" and not isinstance(value, (int, float)):
+                    raise ValueError(f"prices.{key}.{field_name} must be a number, got {value!r}")
+    return prices
+
+
 def load_catalog(path: str | Path) -> Catalog:
     data = yaml.safe_load(Path(path).read_text())
     rt = data["realtime"]
@@ -88,7 +101,7 @@ def load_catalog(path: str | Path) -> Catalog:
                                rt.get("fallback_to")),
         settings=ModeSettings(**(data.get("settings") or {})),
         fallback_to=fallback_to,
-        prices=data.get("prices") or {},
+        prices=_check_prices(data.get("prices") or {}),
     )
 
 

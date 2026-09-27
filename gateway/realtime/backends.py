@@ -108,7 +108,8 @@ class TurnAccounting:
             return
         kind = entry[0]
         if isinstance(data, LLMUsageMetricsData) and kind == "s2s":
-            counts = counts_from_pipecat(data.value, net=False)  # OpenAI Realtime, Gemini Live: gross
+            # OpenAI Realtime and Gemini Live report gross input; Gemini's thinking sits outside output.
+            counts = counts_from_pipecat(data.value, net=False, reasoning_in_output=entry[1] != "gemini")
         elif isinstance(data, STTUsageMetricsData):
             counts = Counts(audio_seconds=data.value.audio_seconds)
         elif isinstance(data, TTSUsageMetricsData):
@@ -129,7 +130,9 @@ class TurnAccounting:
 
     def close(self, attempt: str = "ok") -> dict | None:
         if self._turn is None:
-            return None
+            if not self._pending:
+                return None
+            self.open()  # usage measured outside any response: still billed, still recorded
         turn, self._turn, self._last = self._turn, None, self._turn
         self.usage.set_session_turn(self.session_id, None)
         for (kind, provider, model), counts in self._pending.items():
@@ -236,8 +239,10 @@ class PipecatBackend:
     swallow transcripts) where the frames it reads still flow."""
 
     def __init__(self, name: str, provider: str, key: str,
-                 build: Callable[["PipecatBackend", dict, Emit], list[FrameProcessor]]):
+                 build: Callable[["PipecatBackend", dict, Emit], list[FrameProcessor]],
+                 accounting: "TurnAccounting | None" = None):
         self.name, self.provider, self.key = name, provider, key
+        self.accounting = accounting
         self._build = build
         self.failed = asyncio.Event()
         self.failure: tuple[str, str, int | None] | None = None
@@ -334,6 +339,11 @@ class PipecatBackend:
             except (TimeoutError, asyncio.CancelledError):
                 self._runner_task.cancel()
         self._worker = self._runner_task = None
+        if self.accounting:  # hang-up or failover mid-response: keep what was measured
+            try:
+                self.accounting.close(attempt="failed" if self.failed.is_set() else "ok")
+            except Exception:  # noqa: BLE001 — bookkeeping must not block teardown
+                log.exception("could not record realtime usage")
 
 
 # --- factories ---------------------------------------------------------------------------
@@ -373,7 +383,7 @@ def gemini_live_option(step: Step, keys: dict[str, list[str]], pool: KeyPool, mo
                 acct.register(llm, "s2s", step.provider, step.model.removeprefix("models/"))
             return [llm, EventSink(emit, acct)]
 
-        return PipecatBackend(f"{step.provider}:{step.model}", pool_name, key, build)
+        return PipecatBackend(f"{step.provider}:{step.model}", pool_name, key, build, acct)
 
     return option
 
@@ -402,7 +412,7 @@ def openai_realtime_option(step: Step, keys: dict[str, list[str]], pool: KeyPool
                 acct.register(llm, "s2s", step.provider, step.model)
             return [llm, EventSink(emit, acct)]
 
-        return PipecatBackend(f"{step.provider}:{step.model}", pool_name, key, build)
+        return PipecatBackend(f"{step.provider}:{step.model}", pool_name, key, build, acct)
 
     return option
 
@@ -504,7 +514,7 @@ def cascade_option(chain: RealtimeChain, keys: dict[str, list[str]], pool: KeyPo
                 aggregators.assistant(),
             ]
 
-        return PipecatBackend("cascade", pool_name, "-", build)
+        return PipecatBackend("cascade", pool_name, "-", build, acct)
 
     return option
 

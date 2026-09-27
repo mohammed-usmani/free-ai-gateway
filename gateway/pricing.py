@@ -181,14 +181,16 @@ def counts_from_litellm(usage) -> Counts:
                   reasoning=_int(getattr(cd, "reasoning_tokens", 0)), audio_input=audio_in, audio_output=audio_out)
 
 
-def counts_from_pipecat(u, net: bool) -> Counts:
+def counts_from_pipecat(u, net: bool, reasoning_in_output: bool = True) -> Counts:
     """Pipecat LLMTokenUsage: `prompt_tokens` is net of cache for Anthropic/Bedrock, gross
-    otherwise. Audio counts include their cached part."""
+    otherwise. Audio counts include their cached part. Gemini Live reports thinking tokens
+    outside `completion_tokens` (reasoning_in_output=False); they're billed as output."""
     cr, cw = _int(u.cache_read_input_tokens), _int(u.cache_creation_input_tokens)
     gross = _int(u.prompt_tokens) + (cr + cw if net else 0)
     audio_cached = _int(u.cache_read_input_audio_tokens)
     audio_in = _int(u.input_audio_tokens) - audio_cached
     audio_out = _int(u.output_audio_tokens)
     return Counts(input=max(0, gross - cr - cw - audio_in), cache_read=cr - audio_cached, cache_write=cw,
-                  output=max(0, _int(u.completion_tokens) - audio_out), reasoning=_int(u.reasoning_tokens),
-                  audio_input=audio_in, audio_output=audio_out, audio_cache_read=audio_cached)
+                  output=max(0, _int(u.completion_tokens) - audio_out) + (0 if reasoning_in_output else _int(u.reasoning_tokens)),
+                  reasoning=_int(u.reasoning_tokens), audio_input=audio_in, audio_output=audio_out,
+                  audio_cache_read=audio_cached)
