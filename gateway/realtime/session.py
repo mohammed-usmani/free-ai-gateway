@@ -55,12 +55,15 @@ class NoBackend(Exception):
 
 
 class RealtimeSession:
-    def __init__(self, ws: WebSocket, options: list[BackendOption], pool: KeyPool, session_id: str | None = None):
+    def __init__(self, ws: WebSocket, options, pool: KeyPool, session_id: str | None = None,
+                 initial_config: dict | None = None):
+        """`options` is a list, or a function of the session config returning one (resolved when
+        the first backend starts, so `session.type: "transcription"` can pick STT-only)."""
         self.ws = ws
         self.session_id = session_id or f"sess_{uuid.uuid4().hex[:20]}"
         self.options = options
         self.pool = pool
-        self.config: dict = {}
+        self.config: dict = dict(initial_config or {})
         self.backend: Backend | None = None
         self._option = 0
         self._lock = asyncio.Lock()
@@ -155,6 +158,8 @@ class RealtimeSession:
             self.backend = None
 
     async def _start_next(self):
+        if callable(self.options):
+            self.options = self.options(self.config)
         while self._option < len(self.options):
             backend = self.options[self._option]()
             if backend is None:

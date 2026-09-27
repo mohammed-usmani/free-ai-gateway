@@ -705,10 +705,17 @@ def build() -> FastAPI:
         token = secrets.token_urlsafe(24)
         model = ws.query_params.get("model", "realtime")
         usage.register_session(token, session_id, modes.split(model)[0])
-        options = realtime_options_for(model, catalogs, mode_keys, pool, self_url, gateway_key,
-                                       RealtimeContext(usage, session_id, token), private=_private(ws))
+        intent = ws.query_params.get("intent") == "transcription"
+        ctx = RealtimeContext(usage, session_id, token)
+
+        def options(config: dict):
+            return realtime_options_for(model, catalogs, mode_keys, pool, self_url, gateway_key, ctx,
+                                        private=_private(ws),
+                                        transcription=intent or config.get("type") == "transcription")
+
         try:
-            await RealtimeSession(ws, options, pool, session_id=session_id).run()
+            await RealtimeSession(ws, options, pool, session_id=session_id,
+                                  initial_config={"type": "transcription"} if intent else None).run()
         finally:
             usage.unregister_session(token)
 

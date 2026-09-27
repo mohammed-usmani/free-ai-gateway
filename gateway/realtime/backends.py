@@ -18,6 +18,7 @@ from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.frames.frames import (
     ErrorFrame,
+    InterimTranscriptionFrame,
     MetricsFrame,
     InputAudioRawFrame,
     InterruptionFrame,
@@ -154,20 +155,37 @@ def _usage_summary(turn: dict | None) -> dict | None:
 
 
 class TranscriptTap(FrameProcessor):
-    """Emits the caller's transcript. Sits right after STT: the user aggregator consumes it."""
+    """Emits the caller's transcript (interim deltas, then the final text). Sits right after
+    STT: the user aggregator consumes it. In a transcription-only session every final
+    utterance is its own turn."""
 
-    def __init__(self, emit: Emit, accounting: TurnAccounting | None = None):
+    def __init__(self, emit: Emit, accounting: TurnAccounting | None = None, transcription: bool = False):
         super().__init__()
         self._emit = emit
         self._accounting = accounting
+        self._transcription = transcription
+        self._item: str | None = None
+
+    def _item_id(self) -> str:
+        self._item = self._item or f"item_{uuid.uuid4().hex[:20]}"
+        return self._item
 
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        if isinstance(frame, TranscriptionFrame):
+        if isinstance(frame, MetricsFrame) and self._transcription and self._accounting:
+            for data in frame.data:  # no EventSink in a transcription session: count STT here
+                self._accounting.on_metrics(data)
+        elif isinstance(frame, InterimTranscriptionFrame):
+            await self._emit(event("conversation.item.input_audio_transcription.delta",
+                                   item_id=self._item_id(), content_index=0, delta=frame.text))
+        elif isinstance(frame, TranscriptionFrame):
             if self._accounting:
                 self._accounting.open()  # the caller finished speaking: this turn starts
             await self._emit(event("conversation.item.input_audio_transcription.completed",
-                                   item_id=f"item_{uuid.uuid4().hex[:20]}", content_index=0, transcript=frame.text))
+                                   item_id=self._item_id(), content_index=0, transcript=frame.text))
+            self._item = None
+            if self._transcription and self._accounting:
+                self._accounting.close()
         await self.push_frame(frame, direction)
 
 
@@ -216,7 +234,7 @@ class EventSink(TranscriptTap):
             await self._emit(event("input_audio_buffer.speech_stopped", audio_end_ms=0, item_id=""))
         elif isinstance(frame, InterruptionFrame):
             await self._close("cancelled")
-        elif isinstance(frame, TranscriptionFrame):
+        elif isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame)):
             await TranscriptTap.process_frame(self, frame, direction)
             return
         elif isinstance(frame, TTSStartedFrame):
@@ -534,6 +552,29 @@ def cascade_option(chain: RealtimeChain, keys: dict[str, list[str]], pool: KeyPo
     return option
 
 
+def transcription_option(chain: RealtimeChain, keys, pool: KeyPool, mode: str = "free",
+                         ctx: RealtimeContext | None = None):
+    """Speech-to-text only (OpenAI transcription sessions): STT fails over inside the session."""
+    pool_name = f"{mode}:transcription"
+
+    def option():
+        if not any(keys.get(s.provider) for s in chain.stt) or pool.pick(pool_name, ["-"]) is None:
+            return None
+        acct = _accounting(ctx, mode)
+
+        def build(backend: PipecatBackend, config: dict, emit: Emit):
+            from pipecat.pipeline.service_switcher import ServiceSwitcher, ServiceSwitcherStrategyFailover
+
+            stts = _pick_services(chain.stt, keys, pool, mode, _stt, acct, "stt")
+            if not stts:
+                raise RuntimeError("every STT key is cooling down")
+            return [ServiceSwitcher(stts, ServiceSwitcherStrategyFailover), TranscriptTap(emit, acct, transcription=True)]
+
+        return PipecatBackend("transcription", pool_name, "-", build, acct)
+
+    return option
+
+
 _S2S = {"gemini": gemini_live_option, "openai": openai_realtime_option}
 
 
@@ -550,7 +591,7 @@ def realtime_options(chain: RealtimeChain, keys, pool: KeyPool, llm_base_url: st
 
 def realtime_options_for(model: str, catalogs: dict[str, Catalog], mode_keys: dict[str, dict[str, list[str]]],
                          pool: KeyPool, llm_base_url: str, gateway_key: str, ctx: RealtimeContext | None,
-                         private: bool = False):
+                         private: bool = False, transcription: bool = False):
     """`paid/realtime` → paid options, then those of `realtime.fallback_to` (another mode)."""
     head, _, rest = model.partition("/")
     mode = head if head in catalogs and rest else "free"
@@ -560,7 +601,11 @@ def realtime_options_for(model: str, catalogs: dict[str, Catalog], mode_keys: di
         chain = catalogs[mode].realtime
         catalog = catalogs[mode]
         allowed = (lambda p, c=catalog: c.is_private(p)) if private else (lambda p: True)
-        options += realtime_options(chain, mode_keys.get(mode, {}), pool, llm_base_url, gateway_key, mode, ctx,
-                                    allowed, private)
+        if transcription:
+            stt_only = RealtimeChain([], [s for s in chain.stt if allowed(s.provider)], chain.llm_alias, [])
+            options.append(transcription_option(stt_only, mode_keys.get(mode, {}), pool, mode, ctx))
+        else:
+            options += realtime_options(chain, mode_keys.get(mode, {}), pool, llm_base_url, gateway_key, mode, ctx,
+                                        allowed, private)
         mode = (chain.fallback_to or "").partition("/")[0] or None
     return options
