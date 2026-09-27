@@ -28,6 +28,7 @@ from gateway.realtime.session import RealtimeSession
 from gateway.modes import Answer, Modes
 from gateway.observe import Observer
 from gateway.pricing import Counts, Pricer, counts_from_litellm
+from gateway.responses import ResponseStore, as_items
 from gateway.usage import UsageStore
 from gateway.router import Exhausted, Gateway, NoCapableStep, NoPrivateProvider, UnknownModel, should_fall_back, status_of
 from gateway.speech import MEDIA_TYPES, SpeechError, can_stream, open_stream
@@ -135,6 +136,16 @@ def _estimate(model: str, messages, text: str) -> Counts:
     return Counts(input=prompt, output=output)
 
 
+def _responses_counts(u) -> Counts:
+    if u is None:
+        return Counts()
+    get = (lambda o, k: (o or {}).get(k) if isinstance(o, dict) else getattr(o, k, None))
+    cached = get(get(u, "input_tokens_details"), "cached_tokens") or 0
+    reasoning = get(get(u, "output_tokens_details"), "reasoning_tokens") or 0
+    return Counts(input=max(0, (get(u, "input_tokens") or 0) - cached), cache_read=cached,
+                  output=get(u, "output_tokens") or 0, reasoning=reasoning)
+
+
 def _was_cached(resp) -> bool:
     return bool((getattr(resp, "_hidden_params", None) or {}).get("cache_hit"))
 
@@ -163,11 +174,12 @@ def _stt_counts(resp, data: bytes) -> Counts:
 
 
 def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usage: UsageStore | None = None,
-               lifespan=None) -> FastAPI:
+               lifespan=None, responses: ResponseStore | None = None) -> FastAPI:
     app = FastAPI(title="Free AI Gateway", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     all_keys = modes.keys()
     usage = usage or UsageStore(":memory:", Pricer({}, bundled={}, fetch=None))
     app.state.usage = usage
+    responses = responses or ResponseStore(":memory:")
 
     def scrub(text: str) -> str:
         for key in all_keys:
@@ -283,6 +295,69 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
         record(turn, "embed", answer, Counts(input=int(getattr(u, "prompt_tokens", 0) or 0)), started,
                attempt="cached" if _was_cached(answer.resp) else "ok")
         return JSONResponse(answer.resp.model_dump(), headers={**headers(answer), "x-gateway-turn-id": turn[0]})
+
+    @app.post("/v1/responses", dependencies=auth)
+    async def create_response(request: Request):
+        """OpenAI Responses API on any provider. With store (the default) the gateway keeps the
+        conversation so previous_response_id works; providers are always called with store=false."""
+        body = _client_params(await _json_object(request))
+        model = body.pop("model", "")
+        store = body.pop("store", True) is not False
+        previous = body.pop("previous_response_id", None)
+        history = []
+        if previous:
+            history = await asyncio.to_thread(responses.history, previous)
+            if history is None:
+                raise HTTPException(404, f"no stored response {previous!r} (it may have expired or used store=false)")
+        new_items = as_items(body.pop("input", None))
+        items = history + new_items
+        started = time.monotonic()
+        answer = await modes.call("aresponses", model, private=_private(request), input=items, store=False,
+                                  **body, **cache_args(request, model))
+        turn = begin(request, "responses", model)
+
+        def finish(resp):
+            record(turn, "responses", answer, _responses_counts(getattr(resp, "usage", None)), started)
+            if store and resp is not None:
+                data = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
+                responses.save(data["id"], items, data.get("output") or [], data)
+
+        if not body.get("stream"):
+            finish(answer.resp)
+            return JSONResponse(answer.resp.model_dump(), headers={**headers(answer), "x-gateway-turn-id": turn[0]})
+
+        async def events():
+            final = None
+            try:
+                async for ev in answer.resp:
+                    kind = str(getattr(getattr(ev, "type", None), "value", getattr(ev, "type", "")))
+                    if kind == "response.completed":
+                        final = getattr(ev, "response", None)
+                    yield f"event: {kind}\ndata: {ev.model_dump_json()}\n\n"
+            except Exception as exc:  # noqa: BLE001 — committed stream: report, don't splice
+                yield f"event: error\ndata: {json.dumps({'type': 'error', 'message': scrub(str(exc))})}\n\n"
+            finally:
+                try:
+                    finish(final)
+                except Exception:  # noqa: BLE001
+                    log.exception("could not store streamed response")
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(events(), media_type="text/event-stream",
+                                 headers={**headers(answer), "x-gateway-turn-id": turn[0]})
+
+    @app.get("/v1/responses/{response_id}", dependencies=auth)
+    async def get_response(response_id: str):
+        stored = await asyncio.to_thread(responses.get, response_id)
+        if not stored:
+            raise HTTPException(404, "no such stored response")
+        return stored["response"]
+
+    @app.delete("/v1/responses/{response_id}", dependencies=auth)
+    async def delete_response(response_id: str):
+        if not await asyncio.to_thread(responses.delete, response_id):
+            raise HTTPException(404, "no such stored response")
+        return {"id": response_id, "object": "response", "deleted": True}
 
     @app.post("/v1/audio/transcriptions", dependencies=auth)
     async def transcriptions(
@@ -547,4 +622,5 @@ def build() -> FastAPI:
             task.cancel()
         process_lock.release()
 
-    return create_app(modes, pool, gateway_key, realtime, usage, lifespan)
+    responses = ResponseStore(state_db, retention_days=float(os.environ.get("RESPONSES_RETENTION_DAYS", 30)))
+    return create_app(modes, pool, gateway_key, realtime, usage, lifespan, responses)

@@ -16,6 +16,7 @@ MESSAGES = {"day": "Quota exceeded for metric: generate_content_free_tier_reques
 
 app = FastAPI()
 calls: list[tuple[str, str]] = []
+bodies: list[dict] = []
 
 
 def _fail(request: Request):
@@ -36,6 +37,7 @@ async def chat(request: Request):
     if err:
         return err
     body = await request.json()
+    bodies.append(body)
     text = f"{body['model']}:{key}"
     if body.get("stream"):
         def gen():

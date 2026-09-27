@@ -14,3 +14,4 @@ def upstream_url():
 @pytest.fixture(autouse=True)
 def _clear_calls():
     fake_upstream.calls.clear()
+    fake_upstream.bodies.clear()
