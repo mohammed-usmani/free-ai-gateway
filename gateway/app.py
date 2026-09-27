@@ -26,7 +26,7 @@ from gateway.realtime.session import RealtimeSession
 from gateway.modes import Answer, Modes
 from gateway.pricing import Counts, Pricer, counts_from_litellm
 from gateway.usage import UsageStore
-from gateway.router import Exhausted, Gateway, UnknownModel, status_of
+from gateway.router import Exhausted, Gateway, NoCapableStep, UnknownModel, status_of
 
 
 # Request fields LiteLLM would treat as overrides of the configured deployment: they could
@@ -151,6 +151,10 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
     @app.exception_handler(UnknownModel)
     async def unknown_model(_: Request, exc: UnknownModel):
         return _error(404, f"model {exc.args[0]!r} is not configured or has no keys", "model_not_found")
+
+    @app.exception_handler(NoCapableStep)
+    async def no_capable_step(_: Request, exc: NoCapableStep):
+        return _error(400, str(exc), "unsupported_request")
 
     @app.exception_handler(Exhausted)
     async def exhausted(_: Request, exc: Exhausted):

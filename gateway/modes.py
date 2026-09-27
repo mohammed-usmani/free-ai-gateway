@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Any
 
-from gateway.router import Exhausted, Gateway, UnknownModel
+from gateway.router import Exhausted, Gateway, NoCapableStep, UnknownModel
 
 DEFAULT_MODE = "free"
 
@@ -38,7 +38,7 @@ class Modes:
         try:
             resp, group, skipped = await gateway.call(method, name, **kwargs)
             return Answer(resp, mode, group, skipped)
-        except (Exhausted, UnknownModel) as exc:
+        except (Exhausted, UnknownModel, NoCapableStep) as exc:
             target = gateway.catalog.fallback_to.get(name)
             if not target or name not in gateway.catalog.aliases:
                 raise
@@ -46,7 +46,7 @@ class Modes:
                 return await self.call(method, target, **kwargs)
             except UnknownModel:
                 # The fallback has no keys either: report why this chain failed.
-                if isinstance(exc, Exhausted):
+                if isinstance(exc, (Exhausted, NoCapableStep)):
                     raise exc from None
                 raise
 

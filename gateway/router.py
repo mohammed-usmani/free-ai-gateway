@@ -7,9 +7,12 @@ from step to step is ours: LiteLLM's own fallbacks also fire on 400s, which we m
 
 import asyncio
 
+import re
+
 import litellm
 from litellm import Router
 
+from gateway.capabilities import GATEWAY_STEP_OPTIONS, needs_for, step_can
 from gateway.config import Catalog, Step, available
 
 
@@ -18,12 +21,23 @@ def status_of(exc: Exception) -> int | None:
     return getattr(exc, "status_code", None)
 
 
+_CANT_DO = re.compile(r"does not support|doesn't support|not supported|unsupported|context length|context window|"
+                      r"maximum context|too many tokens|image input|vision", re.I)
+
+
 def should_fall_back(exc: Exception) -> bool:
-    """Provider trouble moves on; a request the provider rejects as malformed does not."""
+    """Provider trouble moves on, and so does "this model can't do that" (context too long,
+    images/tools/JSON unsupported). A request that is simply malformed returns to the caller."""
     status = status_of(exc)
     if status is None or not isinstance(status, int):
         return True  # connection errors, timeouts
+    if status == 400:
+        return isinstance(exc, litellm.ContextWindowExceededError) or bool(_CANT_DO.search(str(exc)))
     return status in (401, 403, 404, 408, 429) or status >= 500
+
+
+class NoCapableStep(Exception):
+    """No step of the chain can serve what this request needs."""
 
 
 class UnknownModel(Exception):
@@ -45,6 +59,7 @@ class Gateway:
         self.settings = catalog.settings
         self.keys = keys
         self._chains: dict[str, list[str]] = {}
+        self._steps: dict[str, Step] = {}
         model_list: list[dict] = []
         registered: set[str] = set()
 
@@ -53,6 +68,7 @@ class Gateway:
             for step in available(steps, keys):
                 group = f"{step.provider}/{step.model}"
                 groups.append(group)
+                self._steps.setdefault(group, step)
                 if group not in registered:
                     registered.add(group)
                     model_list += self._deployments(group, step)
@@ -75,7 +91,8 @@ class Gateway:
         return [
             {
                 "model_name": group,
-                "litellm_params": {"model": f"{step.provider}/{step.model}", "api_key": key, **step.options},
+                "litellm_params": {"model": f"{step.provider}/{step.model}", "api_key": key,
+                                   **{k: v for k, v in step.options.items() if k not in GATEWAY_STEP_OPTIONS}},
             }
             for key in self.keys[step.provider]
         ]
@@ -100,11 +117,19 @@ class Gateway:
         sending anything is still fallen back from; after that the stream is committed.
         """
         last: Exception | None = None
-        for skipped, group in enumerate(self.chain(model)):
+        needs = needs_for(method, kwargs)
+        chain = self.chain(model)
+        reasons = []
+        for skipped, group in enumerate(chain):
+            ok, why = step_can(self._steps.get(group) or Step(*group.split("/", 1)), needs)
+            if not ok:
+                reasons.append(f"{group}: {why}")
+                continue
             try:
                 if kwargs.get("stream"):
-                    resp = await asyncio.wait_for(self._first_chunk(method, group, kwargs),
-                                                  self.settings.first_byte_timeout)
+                    step = self._steps.get(group)
+                    timeout = (step and step.options.get("first_byte_timeout")) or self.settings.first_byte_timeout
+                    resp = await asyncio.wait_for(self._first_chunk(method, group, kwargs), timeout)
                 else:
                     resp = await getattr(self.router, method)(model=group, **kwargs)
                 return resp, group, skipped
@@ -112,6 +137,8 @@ class Gateway:
                 if not should_fall_back(exc):
                     raise
                 last = exc
+        if len(reasons) == len(chain):
+            raise NoCapableStep(f"no model for {model!r} supports this request ({needs.describe()}): " + "; ".join(reasons))
         raise Exhausted(last, self._retry_after(model))
 
     async def _first_chunk(self, method, group, kwargs):
