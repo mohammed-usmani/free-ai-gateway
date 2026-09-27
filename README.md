@@ -1,8 +1,14 @@
 # Free AI Gateway
 
-One OpenAI-compatible endpoint over the **free tiers that need no card**: chat LLMs, embeddings,
-speech-to-text, text-to-speech and realtime voice. It rotates your keys per provider and falls
-back to the next provider when one is down, rate-limited or rejects a key.
+One OpenAI-compatible endpoint for chat LLMs, embeddings, speech-to-text, text-to-speech and
+realtime voice, in two modes:
+
+- **free** — the free tiers that need no card; stretches quota across providers.
+- **paid** — OpenAI, Anthropic, Gemini and paid voice; tuned for reliability, and can fall back
+  to free as a last resort.
+
+It rotates keys per provider, falls back to the next provider when one is down, rate-limited or
+rejects a key, and records **token usage and cost per turn** for every model in both modes.
 
 Point anything that speaks OpenAI at it (the OpenAI SDKs, LangChain, LiveKit, Pipecat) by
 changing `base_url`.
@@ -24,10 +30,49 @@ client.chat.completions.create(model="chat-smart", messages=[{"role": "user", "c
 | `WS /v1/realtime` (OpenAI Realtime protocol, PCM16 24 kHz) | Gemini Live, else STT → `chat-fast` → TTS |
 | `GET /v1/models`, `GET /health` | usable aliases; key states (masked) |
 
-Any `provider/model` (e.g. `groq/openai/gpt-oss-20b`) also works: that provider's keys rotate,
-without cross-provider fallback.
+Paid aliases (`providers.paid.yaml`): `paid/chat-best`, `paid/chat-smart`, `paid/chat-fast`,
+`paid/embed-openai-small|large`, `paid/stt`, `paid/tts`, and `/v1/realtime?model=paid/realtime`
+(OpenAI Realtime → Gemini Live → paid cascade → free realtime). A bare alias means free.
 
-Responses carry `x-gateway-model` (which step answered) and `x-gateway-fallbacks` (steps skipped).
+Any `provider/model` (e.g. `groq/openai/gpt-oss-20b`, or `paid/anthropic/claude-sonnet-5`) also
+works: that provider's keys rotate, without cross-provider fallback.
+
+Responses carry `x-gateway-mode` and `x-gateway-model` (what answered), `x-gateway-fallbacks`
+(steps skipped) and `x-gateway-turn-id`.
+
+## Modes
+
+| | free | paid |
+|---|---|---|
+| Catalog | `providers.free.yaml` | `providers.paid.yaml` |
+| Keys | `GROQ_API_KEYS=…` | `PAID_OPENAI_API_KEYS=…` (never shared with free) |
+| 429 cooldown | 60 s | 5 s, 2 quick retries |
+| Stream must start within | 20 s | 8 s |
+| When the chain is exhausted | 503 | `fallback_to` (e.g. `free/chat-fast`), response says `x-gateway-mode: free` |
+
+## Usage and cost
+
+Every call is a **turn** made of priced **components**. A chat call is one turn with one
+component; a realtime cascade response is one turn with `stt` (seconds), `llm` (tokens, from the
+provider that really answered) and `tts` (characters); speech-to-speech is one `s2s` component
+with text/audio/cached tokens. Tokens are stored as disjoint buckets: uncached input, cache read,
+cache write, output (reasoning shown separately), audio in/out.
+
+```bash
+curl -H "Authorization: Bearer $GATEWAY_API_KEY" localhost:8000/v1/usage?group_by=model   # totals
+curl ... localhost:8000/v1/usage/turns/<x-gateway-turn-id>                               # breakdown
+curl ... "localhost:8000/v1/usage/turns?conversation_id=<id>"   # send x-gateway-conversation-id
+curl -X POST ... localhost:8000/v1/usage/reprice?from=2026-09-01                         # recompute
+```
+`group_by`: model, provider, mode, alias, endpoint, kind, day. Realtime clients also get the
+turn's breakdown in `response.done.response.usage`. Prompts, outputs and keys are never stored.
+
+**Prices** come from, in order: the cost the provider reports (OpenRouter), your `prices:`
+overrides (with `effective_from` dates), LiteLLM's price table re-fetched every
+`PRICE_REFRESH_HOURS` (last good copy kept on failure), then the table bundled with LiteLLM.
+Unknown price → cost is recorded as `null`, never guessed; `/health` lists those models under
+`pricing.unpriced` along with the price table's age. Streaming voice providers aren't in
+LiteLLM's table — add their rates under `prices:` to see their cost.
 
 ## How fallback works
 
@@ -47,7 +92,9 @@ Responses carry `x-gateway-model` (which step answered) and `x-gateway-fallbacks
 cp .env.example .env         # set GATEWAY_API_KEY and whichever provider keys you have
 uv sync
 make run                     # uvicorn on :8000
-make smoke                   # one real call per usable alias + a realtime turn
+make smoke                   # one real call per usable free alias + a realtime turn, with cost
+make smoke-paid              # the same for paid mode
+make usage                   # usage totals by model
 make test                    # offline suite (fake upstream, no keys, no quota)
 ```
 
@@ -76,6 +123,9 @@ Things to know:
 ```
 gateway/config.py            keys from env, providers.yaml
 gateway/router.py            LiteLLM key rotation + our step-to-step fallback
+gateway/modes.py             free/paid dispatch and cross-mode fallback
+gateway/pricing.py           layered prices, token buckets
+gateway/usage.py             turns and components in SQLite
 gateway/keypool.py           SQLite key health for realtime
 gateway/app.py               HTTP + WebSocket API
 gateway/realtime/session.py  Realtime protocol, backend failover

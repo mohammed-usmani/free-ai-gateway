@@ -1,0 +1,72 @@
+# Paid mode: reliability first. Keys: PAID_<PROVIDER>_API_KEYS (never shared with free mode).
+# Call as model "paid/<alias>". Model ids and prices checked against LiteLLM 1.102.1's price
+# table on 2026-09-27; prices refresh from LiteLLM every PRICE_REFRESH_HOURS.
+
+settings:
+  cooldown_seconds: 5        # paid rate limits reset fast
+  num_retries: 2             # quick retries on the same provider before falling back
+  first_byte_timeout: 8      # seconds a stream may take to start before we fall back
+
+aliases:
+  chat-best:
+    steps:
+      - {provider: anthropic, model: claude-opus-5-5}
+      - {provider: openai, model: gpt-5.5}
+      - {provider: gemini, model: gemini-3.1-pro-preview}
+    fallback_to: paid/chat-smart
+  chat-smart:
+    steps:
+      - {provider: anthropic, model: claude-sonnet-5}
+      - {provider: openai, model: gpt-5.6}
+      - {provider: gemini, model: gemini-3.1-pro-preview}
+    fallback_to: free/chat-smart
+  chat-fast:
+    steps:
+      - {provider: anthropic, model: claude-haiku-4-5}
+      - {provider: openai, model: gpt-5.4-mini}
+      - {provider: gemini, model: gemini-3.8-flash}
+    fallback_to: free/chat-fast
+
+  # One model per embedding alias: vectors from different models don't mix.
+  embed-openai-small:
+    - {provider: openai, model: text-embedding-3-small}
+  embed-openai-large:
+    - {provider: openai, model: text-embedding-3-large}
+
+  stt:
+    steps:
+      - {provider: openai, model: gpt-4o-transcribe}
+      - {provider: deepgram, model: nova-3}
+      - {provider: elevenlabs, model: scribe_v2}
+      - {provider: gemini, model: gemini-3.5-transcribe}
+    fallback_to: free/stt
+  tts:
+    steps:
+      - {provider: openai, model: gpt-4o-mini-tts, voice: marin}
+      - {provider: elevenlabs, model: eleven_flash_v2_5, voice: 21m00Tcm4TlvDq8ikWAM}
+      - {provider: gemini, model: gemini-3.1-flash-tts-preview, voice: Kore}
+    fallback_to: free/tts
+
+realtime:
+  s2s:
+    - {provider: openai, model: gpt-realtime-2.1, voice: marin}
+    - {provider: gemini, model: models/gemini-3.1-flash-live-preview, voice: Charon}
+  stt:
+    - {provider: deepgram, model: nova-3}
+    - {provider: assemblyai, model: universal-streaming}
+  llm: chat-fast
+  tts:
+    - {provider: cartesia, model: sonic-3, voice: 71a7ad14-091c-4e8e-a314-022ece01c121}
+    - {provider: elevenlabs, model: eleven_flash_v2_5, voice: 21m00Tcm4TlvDq8ikWAM}
+    - {provider: deepgram, model: aura-2-thalia-en}
+  fallback_to: free/realtime
+
+# Prices you've verified, overriding LiteLLM's table (per token / second / character, USD).
+# Streaming voice (Deepgram, AssemblyAI, Cartesia, ElevenLabs) and Claude Opus 5.5 aren't in
+# LiteLLM's table: until you add them here their cost is recorded as unknown (NULL), and
+# /health lists them under pricing.unpriced. Example:
+#   deepgram/nova-3:
+#     - {effective_from: 2026-09-01, per_second: 0.000128}
+#   cartesia/sonic-3:
+#     - {effective_from: 2026-09-01, per_character: 0.00003}
+prices: {}

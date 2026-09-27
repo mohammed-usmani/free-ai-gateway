@@ -105,3 +105,16 @@ def test_fallback_cycles_and_unknown_targets_are_rejected(tmp_path):
     paid.fallback_to["chat"] = "free/nope"
     with pytest.raises(ValueError, match="unknown"):
         check_fallbacks({"free": free, "paid": paid})
+
+
+def test_shipped_paid_catalog_loads_and_fallbacks_are_sound():
+    free = load_catalog(ROOT / "providers.free.yaml")
+    paid = load_catalog(ROOT / "providers.paid.yaml")
+    check_fallbacks({"free": free, "paid": paid})
+    assert paid.settings.cooldown_seconds < free.settings.cooldown_seconds
+    assert {"chat-best", "chat-smart", "chat-fast", "stt", "tts"} <= set(paid.aliases)
+    assert paid.fallback_to["chat-fast"] == "free/chat-fast"
+    assert [s.provider for s in paid.realtime.s2s] == ["openai", "gemini"]
+    assert paid.realtime.fallback_to == "free/realtime"
+    embeds = [a for a in paid.aliases if a.startswith("embed-")]
+    assert embeds and all(len(paid.aliases[a]) == 1 and a not in paid.fallback_to for a in embeds)

@@ -38,11 +38,17 @@ class Modes:
         try:
             resp, group, skipped = await gateway.call(method, name, **kwargs)
             return Answer(resp, mode, group, skipped)
-        except (Exhausted, KeyError):
+        except (Exhausted, KeyError) as exc:
             target = gateway.catalog.fallback_to.get(name)
             if not target or name not in gateway.catalog.aliases:
                 raise
-            return await self.call(method, target, **kwargs)
+            try:
+                return await self.call(method, target, **kwargs)
+            except KeyError:
+                # The fallback has no keys either: report why this chain failed.
+                if isinstance(exc, Exhausted):
+                    raise exc from None
+                raise
 
     def aliases(self) -> list[str]:
         out = []

@@ -62,3 +62,9 @@ def test_aliases_are_listed_per_mode(upstream_url):
     m = modes(upstream_url, {"groq": ["g"]}, {"openai": ["p"]})
     assert m.aliases() == ["chat", "paid/chat", "paid/solo"]
     assert m.is_alias("paid/chat") and m.is_alias("chat") and not m.is_alias("paid/nope")
+
+
+async def test_fallback_target_without_keys_reports_the_original_failure(upstream_url):
+    m = modes(upstream_url, {}, {"openai": ["down"]})
+    with pytest.raises(Exhausted):
+        await ask(m, "paid/chat")
