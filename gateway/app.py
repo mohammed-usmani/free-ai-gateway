@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+from contextlib import asynccontextmanager
 import json
 import os
 import secrets
@@ -62,8 +63,9 @@ def _stt_counts(resp, data: bytes) -> Counts:
     return Counts(audio_seconds=_audio_seconds(resp, data) or 0)
 
 
-def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usage: UsageStore | None = None) -> FastAPI:
-    app = FastAPI(title="Free AI Gateway")
+def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usage: UsageStore | None = None,
+               lifespan=None) -> FastAPI:
+    app = FastAPI(title="Free AI Gateway", lifespan=lifespan)
     all_keys = modes.keys()
     usage = usage or UsageStore(":memory:", Pricer({}, bundled={}, fetch=None))
     app.state.usage = usage
@@ -274,12 +276,13 @@ def build() -> FastAPI:
     async def realtime(ws: WebSocket):
         await RealtimeSession(ws, options, pool).run()
 
-    app = create_app(modes, pool, gateway_key, realtime, usage)
     refresh_hours = float(os.environ.get("PRICE_REFRESH_HOURS", "6"))
 
-    async def start_price_refresh():
-        if refresh_hours > 0:
-            app.state.price_refresh = asyncio.create_task(pricer.refresh_forever(refresh_hours))
+    @asynccontextmanager
+    async def lifespan(_app):
+        task = asyncio.create_task(pricer.refresh_forever(refresh_hours)) if refresh_hours > 0 else None
+        yield
+        if task:
+            task.cancel()
 
-    app.add_event_handler("startup", start_price_refresh)
-    return app
+    return create_app(modes, pool, gateway_key, realtime, usage, lifespan)
