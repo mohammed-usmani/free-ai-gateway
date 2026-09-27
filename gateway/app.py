@@ -7,6 +7,7 @@ import json
 import os
 import secrets
 import time
+import uuid
 import wave
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,7 +19,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from gateway.config import check_fallbacks, load_catalog, load_keys
 from gateway.keypool import KeyPool, mask
-from gateway.realtime.backends import realtime_options
+from gateway.realtime.backends import RealtimeContext, realtime_options_for
 from gateway.realtime.session import RealtimeSession
 from gateway.modes import Answer, Modes
 from gateway.pricing import Counts, Pricer, counts_from_litellm
@@ -264,17 +265,21 @@ def build() -> FastAPI:
     check_fallbacks(catalogs)
     mode_keys = {m: load_keys(os.environ, prefix="" if m == "free" else "PAID_") for m in catalogs}
     modes = Modes({m: Gateway(c, mode_keys[m]) for m, c in catalogs.items()})
-    catalog, keys = catalogs["free"], mode_keys["free"]
     state_db = os.environ.get("STATE_DB") or os.environ.get("KEYPOOL_DB", "state.db")
     pool = KeyPool(state_db)
     pricer = Pricer({m: c.prices for m, c in catalogs.items()})
     usage = UsageStore(state_db, pricer)
     # The cascade's LLM step calls this gateway's own chat endpoint, so it gets fallback too.
     self_url = os.environ.get("GATEWAY_SELF_URL", f"http://127.0.0.1:{os.environ.get('PORT', '8000')}/v1")
-    options = realtime_options(catalog.realtime, keys, pool, self_url, gateway_key)
 
     async def realtime(ws: WebSocket):
-        await RealtimeSession(ws, options, pool).run()
+        session_id = f"sess_{uuid.uuid4().hex[:20]}"
+        options = realtime_options_for(ws.query_params.get("model", "realtime"), catalogs, mode_keys, pool,
+                                       self_url, gateway_key, RealtimeContext(usage, session_id))
+        try:
+            await RealtimeSession(ws, options, pool, session_id=session_id).run()
+        finally:
+            usage.set_session_turn(session_id, None)
 
     refresh_hours = float(os.environ.get("PRICE_REFRESH_HOURS", "6"))
 

@@ -55,8 +55,9 @@ class NoBackend(Exception):
 
 
 class RealtimeSession:
-    def __init__(self, ws: WebSocket, options: list[BackendOption], pool: KeyPool):
+    def __init__(self, ws: WebSocket, options: list[BackendOption], pool: KeyPool, session_id: str | None = None):
         self.ws = ws
+        self.session_id = session_id or f"sess_{uuid.uuid4().hex[:20]}"
         self.options = options
         self.pool = pool
         self.config: dict = {}
@@ -72,7 +73,7 @@ class RealtimeSession:
 
     async def run(self):
         await self.ws.accept()
-        await self.send(event("session.created", session={"id": f"sess_{uuid.uuid4().hex[:20]}", **self.config}))
+        await self.send(event("session.created", session={"id": self.session_id, **self.config}))
         try:
             while True:
                 raw = await self.ws.receive_text()

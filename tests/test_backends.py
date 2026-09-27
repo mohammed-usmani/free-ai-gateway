@@ -150,7 +150,7 @@ CHAIN = RealtimeChain(
 def test_options_are_none_without_usable_keys(pool):
     assert gemini_live_option(CHAIN.s2s[0], {}, pool)() is None
     assert cascade_option(CHAIN, {"deepgram": []}, pool, "http://x/v1", "g")() is None
-    pool.report("gemini", "k1", 401)
+    pool.report("free:gemini", "k1", 401)
     assert gemini_live_option(CHAIN.s2s[0], {"gemini": ["k1"]}, pool)() is None
 
 
@@ -265,7 +265,7 @@ async def test_stop_does_not_count_as_failure():
 def test_failed_cascade_cools_down(pool):
     option = cascade_option(CHAIN, {"deepgram": ["d"]}, pool, "http://x/v1", "g")
     assert option() is not None
-    pool.report("cascade", "-", None)
+    pool.report("free:cascade", "-", None)
     assert option() is None
 
 
