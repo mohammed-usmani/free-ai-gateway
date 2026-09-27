@@ -151,7 +151,7 @@ def build() -> FastAPI:
     load_dotenv()
     gateway_key = os.environ["GATEWAY_API_KEY"]
     keys = load_keys(os.environ)
-    catalog = load_catalog(os.environ.get("PROVIDERS_FILE", Path(__file__).parent.parent / "providers.yaml"))
+    catalog = load_catalog(os.environ.get("PROVIDERS_FILE", Path(__file__).parent.parent / "providers.free.yaml"))
     gateway = Gateway(catalog, keys)
     pool = KeyPool(os.environ.get("KEYPOOL_DB", "keypool.db"))
     # The cascade's LLM step calls this gateway's own chat endpoint, so it gets fallback too.
