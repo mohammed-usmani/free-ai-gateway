@@ -175,7 +175,10 @@ class UsageStore:
         names = [c.split(".")[-1] if "(" not in c else "day" for c in cols]
         sums = ", ".join(f"SUM(c.{b}) AS {b}" for b in BUCKETS)
         sql = (f"SELECT {', '.join(f'{c} AS {n}' for c, n in zip(cols, names))}, COUNT(DISTINCT t.turn_id) AS turns, "
-               f"COUNT(*) AS calls, {sums}, SUM(c.cost) AS cost, SUM(c.cost IS NULL) AS unpriced_calls "
+               f"COUNT(*) AS calls, {sums}, SUM(c.cost) AS cost, "
+               f"SUM(CASE WHEN c.mode = 'paid' THEN c.cost END) AS billed_cost, "
+               f"SUM(CASE WHEN c.mode != 'paid' THEN c.cost END) AS list_price_estimate, "
+               f"SUM(c.cost IS NULL) AS unpriced_calls "
                f"FROM components c JOIN turns t USING (turn_id) WHERE t.started_at >= ? AND t.started_at < ? "
                f"GROUP BY {', '.join(cols)} ORDER BY {', '.join(cols)}")
         rows = self._db.execute(sql, (start or 0, end or 1e12)).fetchall()
@@ -212,13 +215,19 @@ def _numbers(d: dict) -> dict:
     return d
 
 
+def _basis(mode: str | None) -> str:
+    return "billed" if mode == "paid" else "list_price_estimate"  # free mode: what it would have cost
+
+
 def _turn_dict(t) -> dict:
     d = dict(t)
+    d["cost_basis"] = _basis(d.get("mode"))
     d["cost_complete"] = None if d["cost_complete"] is None else bool(d["cost_complete"])
     return d
 
 
 def _component_dict(c) -> dict:
     d = _numbers(dict(c))
+    d["cost_basis"] = _basis(d.get("mode"))
     d["unit_prices"] = json.loads(d["unit_prices"]) if d["unit_prices"] else None
     return d

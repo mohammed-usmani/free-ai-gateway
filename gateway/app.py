@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response, Streami
 
 from gateway.config import check_fallbacks, known_providers, load_catalog, load_keys
 from gateway.keypool import KeyPool, mask
+from gateway.lock import SingleProcessLock
 from gateway.realtime.backends import RealtimeContext, realtime_options_for
 from gateway.realtime.session import RealtimeSession
 from gateway.modes import Answer, Modes
@@ -394,6 +395,7 @@ def build() -> FastAPI:
     mode_keys = {m: known_providers(load_keys(os.environ, prefix="" if m == "free" else "PAID_"), catalogs.values())
                  for m in catalogs}
     state_db = os.environ.get("STATE_DB") or os.environ.get("KEYPOOL_DB", "state.db")
+    process_lock = SingleProcessLock(state_db)  # refuses a second worker/instance on this state
     pool = KeyPool(state_db)
     pricer = Pricer({m: c.prices for m, c in catalogs.items()})
     usage = UsageStore(state_db, pricer)
@@ -423,5 +425,6 @@ def build() -> FastAPI:
         yield
         if task:
             task.cancel()
+        process_lock.release()
 
     return create_app(modes, pool, gateway_key, realtime, usage, lifespan)

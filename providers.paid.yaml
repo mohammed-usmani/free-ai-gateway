@@ -5,7 +5,7 @@
 settings:
   cooldown_seconds: 5        # paid rate limits reset fast
   num_retries: 2             # quick retries on the same provider before falling back
-  first_byte_timeout: 8      # seconds a stream may take to start before we fall back
+  first_byte_timeout: 30     # seconds a stream may take to start (reasoning models think first)
 
 aliases:
   chat-best:
@@ -22,9 +22,9 @@ aliases:
     fallback_to: free/chat-smart
   chat-fast:
     steps:
-      - {provider: anthropic, model: claude-haiku-4-5}
-      - {provider: openai, model: gpt-5.4-mini}
-      - {provider: gemini, model: gemini-3.8-flash}
+      - {provider: anthropic, model: claude-haiku-4-5, first_byte_timeout: 10}
+      - {provider: openai, model: gpt-5.4-mini, first_byte_timeout: 10}
+      - {provider: gemini, model: gemini-3.8-flash, first_byte_timeout: 10}
     fallback_to: free/chat-fast
 
   # One model per embedding alias: vectors from different models don't mix.
