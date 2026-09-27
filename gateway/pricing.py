@@ -159,6 +159,32 @@ class Pricer:
         self._unpriced.add(key)
         return None
 
+    def health(self, models, at: datetime) -> list[dict]:
+        """For each (mode, provider, model): where its price comes from and what looks off —
+        no price, a price identical to a different model's (a likely copied row), a live price
+        that differs from the bundled one, or an override older than 90 days."""
+        report = []
+        for mode, provider, model in models:
+            price = self.price(provider, model, mode, at)
+            flags = [] if price else ["unpriced"]
+            if price and price.source.startswith("litellm"):
+                table = self._live if price.source.startswith("litellm-live") and self._live else self._bundled
+                twin = _twin(table, provider, model, price.units)
+                if twin:
+                    flags.append(f"same_price_as:{twin}")
+                if self._live and price.source.startswith("litellm-live"):
+                    bundled = self._bundled.get(f"{provider}/{model}") or self._bundled.get(model)
+                    if bundled and _units_from_litellm(bundled) != price.units:
+                        flags.append("price_changed_since_bundled")
+            if price and price.source == "override":
+                entries = self._overrides.get(mode, {}).get(f"{provider}/{model}", [])
+                newest = max(_as_date(e["effective_from"]) for e in entries)
+                if (at.date() - newest).days > 90:
+                    flags.append("override_older_than_90_days")
+            report.append({"mode": mode, "provider": provider, "model": model, "priced": price is not None,
+                           "source": price.source if price else None, "flags": flags})
+        return report
+
     async def refresh(self):
         if not self._fetch:
             return
@@ -181,6 +207,30 @@ class Pricer:
                 "fetched_at": self._live_at and self._live_at.isoformat(timespec="minutes"),
                 "age_hours": age and round(age, 1), "last_error": self._last_error,
                 "unpriced": sorted(self._unpriced)}
+
+
+_BASIC = ("input", "output", "cache_read")
+
+
+def _family(name: str) -> str:
+    return re.sub(r"(-\d{4}-\d{2}-\d{2}|-\d{8}|-latest|-preview)$", "", name.split("/")[-1])
+
+
+def _twin(table: dict, provider: str, model: str, units: dict) -> str | None:
+    """Another model of the same provider with identical base prices — often a row copied
+    from an older sibling when a new model was added before its real price was known."""
+    probe = {k: units.get(k) for k in _BASIC}
+    if not probe["input"]:
+        return None
+    for name, entry in table.items():
+        if not isinstance(entry, dict) or entry.get("litellm_provider") not in (provider, None):
+            continue
+        if _family(name) == _family(model) or name.split("/")[-1].startswith(model) or model.startswith(name.split("/")[-1]):
+            continue  # a dated snapshot or alias of the same model
+        other = _units_from_litellm(entry)
+        if {k: other.get(k) for k in _BASIC} == probe:
+            return name.split("/")[-1] if "/" in name else name
+    return None
 
 
 def _as_date(value) -> date:

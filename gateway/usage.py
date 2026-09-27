@@ -24,7 +24,7 @@ CREATE INDEX IF NOT EXISTS turns_started ON turns(started_at);
 CREATE INDEX IF NOT EXISTS turns_conversation ON turns(conversation_id);
 CREATE TABLE IF NOT EXISTS components (id INTEGER PRIMARY KEY, turn_id TEXT, kind TEXT, mode TEXT, provider TEXT,
   model TEXT, attempt TEXT, {", ".join(f"{b} REAL" for b in BUCKETS)}, provider_cost REAL, unit_prices TEXT,
-  price_source TEXT, cost REAL, latency_ms INTEGER, at REAL);
+  price_source TEXT, cost REAL, latency_ms INTEGER, at REAL, fallbacks INTEGER);
 CREATE INDEX IF NOT EXISTS components_turn ON components(turn_id);
 CREATE TABLE IF NOT EXISTS attempts (at REAL, mode TEXT, provider TEXT, model TEXT, key TEXT, ok INTEGER,
   status INTEGER, error TEXT, latency_ms INTEGER, cache_hit INTEGER);
@@ -39,7 +39,7 @@ class UsageStore:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(_SCHEMA)
         have = {r[1] for r in self._db.execute("PRAGMA table_info(components)")}
-        for column in [*BUCKETS, "provider_cost", "unit_prices", "price_source", "cost", "latency_ms", "at", "attempt",
+        for column in [*BUCKETS, "provider_cost", "unit_prices", "price_source", "cost", "latency_ms", "at", "fallbacks", "attempt",
                        "mode", "kind", "provider", "model"]:
             if column not in have:  # databases from an older version
                 kind = "TEXT" if column in ("unit_prices", "price_source", "attempt", "mode", "kind", "provider", "model") else "REAL"
@@ -61,7 +61,7 @@ class UsageStore:
         return turn_id
 
     def add(self, turn_id, kind, mode, provider, model, counts: Counts, attempt="ok",
-            latency_ms=None, provider_cost=None) -> dict:
+            latency_ms=None, provider_cost=None, fallbacks=0) -> dict:
         at = self._now()
         price = self.pricer.price(provider, model, mode, datetime.fromtimestamp(at, timezone.utc))
         if provider_cost is not None:
@@ -73,7 +73,7 @@ class UsageStore:
         row = {"turn_id": turn_id, "kind": kind, "mode": mode, "provider": provider, "model": model,
                "attempt": attempt, **asdict(counts), "provider_cost": provider_cost,
                "unit_prices": json.dumps(price.units) if price else None, "price_source": source,
-               "cost": value, "latency_ms": latency_ms, "at": at}
+               "cost": value, "latency_ms": latency_ms, "at": at, "fallbacks": fallbacks}
         with self._lock:
             self._db.execute(f"INSERT INTO components ({', '.join(row)}) VALUES ({', '.join('?' * len(row))})",
                              list(row.values()))
@@ -99,6 +99,35 @@ class UsageStore:
             self._db.execute("INSERT INTO attempts VALUES (?,?,?,?,?,?,?,?,?,?)",
                              (row["at"], row["mode"], row["provider"], row["model"], row["key"], int(row["ok"]),
                               row["status"], row["error"], row["latency_ms"], int(row["cache_hit"])))
+
+    def metrics(self, window_seconds: float) -> dict:
+        """Reliability per provider/model (from every attempt) and fallback rate per alias."""
+        since = self._now() - window_seconds
+        rows = self._db.execute("SELECT * FROM attempts WHERE at >= ?", (since,)).fetchall()
+        groups: dict[tuple, list] = {}
+        for r in rows:
+            groups.setdefault((r["mode"], r["provider"], r["model"]), []).append(r)
+        providers = []
+        for (mode, provider, model), items in sorted(groups.items()):
+            tried = [r for r in items if not (r["error"] or "").startswith("skipped")]
+            ok = [r for r in tried if r["ok"]]
+            lat = sorted(r["latency_ms"] for r in ok)
+            errors: dict[str, int] = {}
+            for r in tried:
+                if not r["ok"]:
+                    errors[r["error"] or "unknown"] = errors.get(r["error"] or "unknown", 0) + 1
+            providers.append({
+                "mode": mode, "provider": provider, "model": model, "requests": len(tried),
+                "skipped": len(items) - len(tried), "success_rate": len(ok) / len(tried) if tried else None,
+                "p50_ms": _pct(lat, 0.5), "p95_ms": _pct(lat, 0.95), "errors": errors,
+                "cache_hit_rate": sum(r["cache_hit"] for r in ok) / len(ok) if ok else None,
+            })
+        aliases = [dict(r) for r in self._db.execute(
+            "SELECT t.mode, t.alias, COUNT(DISTINCT t.turn_id) AS turns, "
+            "AVG(CASE WHEN COALESCE(c.fallbacks, 0) > 0 THEN 1.0 ELSE 0.0 END) AS fallback_rate "
+            "FROM turns t JOIN components c USING (turn_id) WHERE t.started_at >= ? GROUP BY t.mode, t.alias "
+            "ORDER BY t.mode, t.alias", (since,)).fetchall()]
+        return {"window_seconds": window_seconds, "providers": providers, "aliases": aliases}
 
     # --- realtime sessions: the cascade's LLM call lands on the session's current turn ---
     # Keyed by a private per-session token (sent only on the loopback call), not the session
@@ -168,6 +197,12 @@ class UsageStore:
             for turn_id in {r["turn_id"] for r in rows}:
                 self._refresh_turn(turn_id)
         return len(rows)
+
+
+def _pct(values: list, q: float):
+    if not values:
+        return None
+    return values[min(len(values) - 1, max(0, round(q * len(values) + 0.5) - 1))]
 
 
 def _numbers(d: dict) -> dict:

@@ -17,7 +17,7 @@ import litellm
 import openai
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 from gateway.config import check_fallbacks, known_providers, load_catalog, load_keys
 from gateway.keypool import KeyPool, mask
@@ -51,6 +51,12 @@ async def _json_object(request: Request) -> dict:
     if not isinstance(body, dict):
         raise HTTPException(400, "body must be a JSON object")
     return body
+
+
+def _health_summary(report: list[dict]) -> dict:
+    return {"models": len(report), "unpriced": sum("unpriced" in r["flags"] for r in report),
+            "suspicious": [f'{r["mode"]}:{r["provider"]}/{r["model"]}: {", ".join(r["flags"])}'
+                           for r in report if r["flags"] and r["flags"] != ["unpriced"]]}
 
 
 def _error(status: int, message: str, kind: str, headers: dict | None = None) -> JSONResponse:
@@ -193,6 +199,7 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
         provider, _, name = answer.group.partition("/")
         try:
             usage.add(turn_id, kind_override or kind, answer.mode, provider, name, counts, attempt=attempt,
+                      fallbacks=answer.skipped,
                       latency_ms=int((time.monotonic() - started) * 1000),
                       provider_cost=reported_cost(provider, usage_obj))
             if is_new:
@@ -308,12 +315,55 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
     async def usage_reprice(start: str | None = Query(None, alias="from"), end: str | None = Query(None, alias="to")):
         return {"repriced": await asyncio.to_thread(usage.reprice, _ts(start), _ts(end))}
 
+    def catalog_models():
+        seen = []
+        for mode, g in modes.gateways.items():
+            c = g.catalog
+            for step in [s for steps in c.aliases.values() for s in steps] + c.realtime.s2s:
+                item = (mode, step.provider, step.model.removeprefix("models/"))
+                if item not in seen:
+                    seen.append(item)
+        return seen
+
+    @app.get("/v1/pricing/health", dependencies=auth)
+    async def pricing_health():
+        return {"pricing": usage.pricer.status(),
+                "models": usage.pricer.health(catalog_models(), datetime.now(timezone.utc))}
+
+    @app.get("/v1/metrics", dependencies=auth)
+    async def metrics(window: str = "24h"):
+        unit = {"m": 60, "h": 3600, "d": 86400}.get(window[-1:], 1)
+        try:
+            seconds = float(window[:-1] if window[-1:] in "mhd" else window) * unit
+        except ValueError:
+            raise HTTPException(400, "window like 30m, 24h, 7d or seconds")
+        return await asyncio.to_thread(usage.metrics, seconds)
+
+    @app.get("/metrics", dependencies=auth, response_class=PlainTextResponse)
+    async def prometheus():
+        data = await asyncio.to_thread(usage.metrics, 86400)
+        lines = ["# HELP gateway_attempts_total Provider attempts in the last 24h.",
+                 "# TYPE gateway_attempts_total gauge"]
+        for p in data["providers"]:
+            labels = f'mode="{p["mode"]}",provider="{p["provider"]}",model="{p["model"]}"'
+            ok = round((p["success_rate"] or 0) * p["requests"])
+            lines.append(f'gateway_attempts_total{{{labels},outcome="ok"}} {ok}')
+            lines.append(f'gateway_attempts_total{{{labels},outcome="error"}} {p["requests"] - ok}')
+            lines.append(f'gateway_attempts_total{{{labels},outcome="skipped"}} {p["skipped"]}')
+            for q in ("p50", "p95"):
+                if p[f"{q}_ms"] is not None:
+                    lines.append(f'gateway_latency_ms{{{labels},quantile="{q}"}} {p[f"{q}_ms"]}')
+        for a in data["aliases"]:
+            lines.append(f'gateway_fallback_rate{{mode="{a["mode"]}",alias="{a["alias"]}"}} {a["fallback_rate"]}')
+        return "\n".join(lines) + "\n"
+
     @app.get("/health")
     async def health():
         return {
             "status": "ok",
             "aliases": modes.aliases(),
-            "pricing": usage.pricer.status(),
+            "pricing": {**usage.pricer.status(), "health": _health_summary(
+                usage.pricer.health(catalog_models(), datetime.now(timezone.utc)))},
             "modes": {
                 mode: {p: {"keys": len(k), "realtime": pool.states(f"{mode}:{p}", k)} for p, k in sorted(g.keys.items())}
                 for mode, g in modes.gateways.items()
