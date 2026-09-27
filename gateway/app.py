@@ -56,6 +56,23 @@ async def _json_object(request: Request) -> dict:
     return body
 
 
+def enable_cache(directory: str, ttl: float):
+    """LiteLLM's disk cache in opt-in mode: only calls passing cache={"use-cache": True} use it."""
+    from litellm.caching.caching import Cache, CacheMode
+
+    litellm.cache = Cache(type="disk", disk_cache_dir=directory, mode=CacheMode.default_off, ttl=ttl)
+
+
+def _cache_wanted(request, modes, model: str) -> bool:
+    flag = (request.headers.get("x-gateway-cache") or "").lower()
+    if flag in ("0", "false", "no"):
+        return False
+    if flag in ("1", "true", "yes"):
+        return True
+    mode, name = modes.split(model)
+    return name in modes.gateways[mode].catalog.cache_aliases
+
+
 def _private(request) -> bool:
     return (request.headers.get("x-gateway-private") or request.query_params.get("private") or "").lower() in ("1", "true", "yes")
 
@@ -116,6 +133,10 @@ def _estimate(model: str, messages, text: str) -> Counts:
     except Exception:  # noqa: BLE001 — an estimate is best effort
         return Counts()
     return Counts(input=prompt, output=output)
+
+
+def _was_cached(resp) -> bool:
+    return bool((getattr(resp, "_hidden_params", None) or {}).get("cache_hit"))
 
 
 def _audio_seconds(resp, data: bytes) -> float | None:
@@ -186,8 +207,16 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
         return _error(status if isinstance(status, int) else 502, scrub(str(exc)), "provider_error")
 
     def headers(answer: Answer) -> dict:
-        return {"x-gateway-mode": answer.mode, "x-gateway-model": answer.group,
-                "x-gateway-fallbacks": str(answer.skipped)}
+        h = {"x-gateway-mode": answer.mode, "x-gateway-model": answer.group, "x-gateway-fallbacks": str(answer.skipped)}
+        if _was_cached(answer.resp):
+            h["x-gateway-cache"] = "hit"
+        return h
+
+    def cache_args(request: Request, model: str) -> dict:
+        # The router passes caching=False unless told otherwise, so opted-in calls say so.
+        if litellm.cache is not None and _cache_wanted(request, modes, model):
+            return {"caching": True, "cache": {"use-cache": True}}
+        return {}
 
     auth = [Depends(require_key)]
 
@@ -225,11 +254,12 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
         if body.get("stream"):
             body["stream_options"] = {**(body.get("stream_options") or {}), "include_usage": True}
         started = time.monotonic()
-        answer = await modes.call("acompletion", model, private=_private(request), **body)
+        answer = await modes.call("acompletion", model, private=_private(request), **body, **cache_args(request, model))
         resp = answer.resp
         turn = begin(request, "chat", model)
         if not body.get("stream"):
-            record(turn, "chat", answer, counts_from_litellm(resp.usage), started, resp.usage)
+            record(turn, "chat", answer, counts_from_litellm(resp.usage), started, resp.usage,
+                   attempt="cached" if _was_cached(resp) else "ok")
             return JSONResponse(resp.model_dump(), headers={**headers(answer), "x-gateway-turn-id": turn[0]})
 
         def on_done(final_usage, text: str):
@@ -247,10 +277,11 @@ def create_app(modes: Modes, pool: KeyPool, gateway_key: str, realtime=None, usa
         body = _client_params(await _json_object(request))
         model = body.pop("model", "")
         started = time.monotonic()
-        answer = await modes.call("aembedding", model, private=_private(request), **body)
+        answer = await modes.call("aembedding", model, private=_private(request), **body, **cache_args(request, model))
         turn = begin(request, "embed", model)
         u = answer.resp.usage
-        record(turn, "embed", answer, Counts(input=int(getattr(u, "prompt_tokens", 0) or 0)), started)
+        record(turn, "embed", answer, Counts(input=int(getattr(u, "prompt_tokens", 0) or 0)), started,
+               attempt="cached" if _was_cached(answer.resp) else "ok")
         return JSONResponse(answer.resp.model_dump(), headers={**headers(answer), "x-gateway-turn-id": turn[0]})
 
     @app.post("/v1/audio/transcriptions", dependencies=auth)
@@ -505,6 +536,7 @@ def build() -> FastAPI:
         finally:
             usage.unregister_session(token)
 
+    enable_cache(os.environ.get("CACHE_DIR", ".cache/responses"), float(os.environ.get("CACHE_TTL", 86400)))
     refresh_hours = float(os.environ.get("PRICE_REFRESH_HOURS", "6"))
 
     @asynccontextmanager

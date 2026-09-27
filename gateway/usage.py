@@ -62,9 +62,13 @@ class UsageStore:
 
     def add(self, turn_id, kind, mode, provider, model, counts: Counts, attempt="ok",
             latency_ms=None, provider_cost=None, fallbacks=0) -> dict:
+        """Price and store one component. attempt="cached" means served from the response
+        cache: nothing was billed."""
         at = self._now()
         price = self.pricer.price(provider, model, mode, datetime.fromtimestamp(at, timezone.utc))
-        if provider_cost is not None:
+        if attempt == "cached":
+            value, source = 0.0, "cache"
+        elif provider_cost is not None:
             value, source = float(provider_cost), "provider"
         elif not any(asdict(counts).values()):
             value, source = None, price.source if price else None  # nothing measured: unknown, not free

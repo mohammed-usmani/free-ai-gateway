@@ -67,6 +67,7 @@ class Catalog:
     fallback_to: dict[str, str] = field(default_factory=dict)
     prices: dict[str, list[dict]] = field(default_factory=dict)
     privacy: dict[str, str] = field(default_factory=dict)  # provider → trains_on_data: no | opt-out | yes
+    cache_aliases: set[str] = field(default_factory=set)  # aliases with `cache: true`
 
     def is_private(self, provider: str) -> bool:
         """Only providers known not to train on API data count as private."""
@@ -103,12 +104,14 @@ def _privacy_word(value) -> str:
 def load_catalog(path: str | Path) -> Catalog:
     data = yaml.safe_load(Path(path).read_text())
     rt = data["realtime"]
-    aliases, fallback_to = {}, {}
+    aliases, fallback_to, cached = {}, {}, set()
     for name, entry in data["aliases"].items():
         if isinstance(entry, dict):
             aliases[name] = _steps(entry["steps"])
             if entry.get("fallback_to"):
                 fallback_to[name] = entry["fallback_to"]
+            if entry.get("cache"):
+                cached.add(name)
         else:
             aliases[name] = _steps(entry)
     return Catalog(
@@ -118,6 +121,7 @@ def load_catalog(path: str | Path) -> Catalog:
         settings=ModeSettings(**(data.get("settings") or {})),
         fallback_to=fallback_to,
         prices=_check_prices(data.get("prices") or {}),
+        cache_aliases=cached,
         privacy={p: _privacy_word((v or {}).get("trains_on_data")) for p, v in (data.get("providers") or {}).items()},
     )
 

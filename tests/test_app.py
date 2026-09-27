@@ -132,6 +132,7 @@ def test_build_reads_env(monkeypatch, tmp_path):
     monkeypatch.setenv("GROQ_API_KEYS", "g1,g2")
     monkeypatch.setenv("STATE_DB", str(tmp_path / "state.db"))
     monkeypatch.setenv("PRICE_REFRESH_HOURS", "0")
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
     client = TestClient(build())
     assert client.get("/health").json()["modes"]["free"]["groq"]["keys"] == 2
     assert any(r.path == "/v1/realtime" for r in client.app.routes)
